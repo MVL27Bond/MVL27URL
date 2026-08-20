@@ -53,6 +53,27 @@
 - Tài khoản Cloudflare có quyền Workers KV và Workers/Pages.
 - Domain dùng custom domain phải được thêm vào zone Cloudflare và DNS phải trỏ đúng theo hướng dẫn Cloudflare.
 
+## Cách nhanh: dán `worker.js` trên Cloudflare Dashboard
+
+Đây là cách dành cho người không muốn dùng terminal. Bạn chỉ cần copy file `worker.js`, nhưng vẫn phải tạo và bind KV một lần để link/settings được lưu vĩnh viễn.
+
+1. Vào **Cloudflare Dashboard → Workers & Pages → Create application → Create Worker**.
+2. Đặt tên Worker, bấm **Deploy** một lần để tạo Worker.
+3. Mở **Edit code**, xóa code mẫu, mở file `worker.js` trong repository, copy toàn bộ nội dung và paste vào editor.
+4. Bấm **Save and deploy**.
+5. Vào **Worker → Settings → Variables and Secrets → KV namespace bindings → Add binding**.
+6. Đặt **Variable name** là `url` và chọn một KV namespace. Nếu chưa có namespace, vào **Storage & Databases → KV → Create namespace**, tạo namespace rồi quay lại bind.
+7. Bấm **Save** và deploy lại Worker.
+8. Mở URL Worker, truy cập `/links`, rồi tạo tài khoản admin lần đầu.
+
+Nếu muốn bảo vệ setup lần đầu, tạo secret `SETUP_KEY` trong **Variables and Secrets**, sau đó nhập secret này vào trường **Bootstrap key**. Không cần tạo `API_KEY` để chạy cài đặt mới; API key có thể bật ngay trong tab **Cài đặt**.
+
+> Nếu quên bind KV, website sẽ hiện trang “Chưa cấu hình lưu trữ” thay vì lỗi server. Không thể bỏ qua KV nếu muốn link và tài khoản tồn tại sau khi Worker restart hoặc deploy lại.
+
+### Gắn domain riêng
+
+Trong **Worker → Settings → Domains & Routes**, chọn **Add Custom Domain**, nhập domain đã nằm trong zone Cloudflare và hoàn tất DNS. Sau đó vào `/links → Cài đặt`, cập nhật lại trường **Domain** để short URL sinh ra đúng domain.
+
 ## Chạy local
 
 ```bash

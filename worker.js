@@ -74,6 +74,19 @@ function jsonResponse(data, status = 200, headers = {}) {
   }));
 }
 
+function getStorage(env) {
+  return env?.url || env?.URLS || env?.KV || null;
+}
+
+function missingStorageResponse(request) {
+  const message = 'Cloudflare KV chưa được bind. Hãy tạo KV namespace và bind với tên url, URLS hoặc KV trong Worker Settings > Variables > KV namespace bindings.';
+  if (new URL(request.url).pathname.startsWith('/api/')) return jsonResponse({ error: message }, 503);
+  return new Response(`<!doctype html><html lang="vi"><meta charset="utf-8"><title>Thiếu cấu hình KV</title><body style="font-family:system-ui;max-width:720px;margin:48px auto;padding:24px"><h1>Chưa cấu hình lưu trữ</h1><p>${message}</p><p>Sau khi bind KV, hãy reload trang này.</p></body></html>`, {
+    status: 503,
+    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }
+  });
+}
+
 async function consumeRateLimit(namespace, request, storage, limit = RATE_LIMIT_REQUESTS) {
   const clientIP = getClientIP(request);
   const key = `ratelimit:${namespace}:${clientIP}`;
@@ -1039,7 +1052,9 @@ export default {
     }
     
     try {
-      const settings = await loadSettings(env.url, env);
+      const storage = getStorage(env);
+      if (!storage) return missingStorageResponse(request);
+      const settings = await loadSettings(storage, env);
 
       // Route: GET /api/setup-status - Initial setup and public configuration
       if (pathname === '/api/setup-status' && request.method === 'GET') {
@@ -1050,7 +1065,7 @@ export default {
       if (pathname === '/api/setup' && request.method === 'POST') {
         if (!hasTrustedOrigin(request, settings)) return jsonResponse({ error: 'Untrusted request origin' }, 403);
         if (settings.initialized) return jsonResponse({ error: 'Setup has already been completed' }, 409);
-        const setupLimit = await consumeRateLimit('setup', request, env.url, SETUP_RATE_LIMIT);
+        const setupLimit = await consumeRateLimit('setup', request, storage, SETUP_RATE_LIMIT);
         if (!setupLimit.allowed) return jsonResponse({ error: 'Too many setup attempts' }, 429, { 'Retry-After': String(setupLimit.retryAfter) });
         const setupKey = typeof env.SETUP_KEY === 'string' ? env.SETUP_KEY : '';
         if (setupKey && request.headers.get('x-setup-key') !== setupKey) return jsonResponse({ error: 'Invalid setup key' }, 401);
@@ -1077,8 +1092,8 @@ export default {
           adminPasswordHash: await hashPassword(password),
           createPasswordHash: createPassword ? await hashPassword(createPassword) : null
         };
-        await saveSettings(env.url, newSettings);
-        const session = await createSession(env.url, username, newSettings.sessionVersion);
+        await saveSettings(storage, newSettings);
+        const session = await createSession(storage, username, newSettings.sessionVersion);
         return jsonResponse({ message: 'Setup completed', settings: publicSettings(newSettings) }, 201, {
           'Set-Cookie': `mvl27_session=${encodeURIComponent(session)}; Path=/; Max-Age=${SESSION_TTL}; HttpOnly; Secure; SameSite=Strict`
         });
@@ -1088,14 +1103,14 @@ export default {
       if (pathname === '/api/auth/login' && request.method === 'POST') {
         if (!hasTrustedOrigin(request, settings)) return jsonResponse({ error: 'Untrusted request origin' }, 403);
         if (!settings.initialized) return jsonResponse({ error: 'Complete initial setup first' }, 428);
-        const loginLimit = await consumeRateLimit('admin-login', request, env.url);
+        const loginLimit = await consumeRateLimit('admin-login', request, storage);
         if (!loginLimit.allowed) return jsonResponse({ error: 'Too many login attempts' }, 429, { 'Retry-After': String(loginLimit.retryAfter) });
         let body;
         try { body = await request.json(); } catch { return jsonResponse({ error: 'Invalid JSON' }, 400); }
         if (typeof body?.username !== 'string' || typeof body?.password !== 'string' || body.username !== settings.adminUsername || !(await verifyPassword(body.password, settings.adminPasswordHash))) {
           return jsonResponse({ error: 'Invalid username or password' }, 401);
         }
-        const session = await createSession(env.url, settings.adminUsername, settings.sessionVersion);
+        const session = await createSession(storage, settings.adminUsername, settings.sessionVersion);
         return jsonResponse({ message: 'Login successful', settings: publicSettings(settings) }, 200, {
           'Set-Cookie': `mvl27_session=${encodeURIComponent(session)}; Path=/; Max-Age=${SESSION_TTL}; HttpOnly; Secure; SameSite=Strict`
         });
@@ -1105,7 +1120,7 @@ export default {
       if (pathname === '/api/auth/logout' && request.method === 'POST') {
         if (!hasTrustedOrigin(request, settings)) return jsonResponse({ error: 'Untrusted request origin' }, 403);
         const token = getSessionToken(request);
-        if (token) await env.url.delete(`${SESSION_PREFIX}${token}`);
+        if (token) await storage.delete(`${SESSION_PREFIX}${token}`);
         return jsonResponse({ message: 'Logged out' }, 200, {
           'Set-Cookie': 'mvl27_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict'
         });
@@ -1113,14 +1128,14 @@ export default {
 
       // Route: GET /api/settings - Read settings (admin only)
       if (pathname === '/api/settings' && request.method === 'GET') {
-        if (!await isAdmin(request, env.url, settings)) return jsonResponse({ error: 'Admin login required' }, 401);
+        if (!await isAdmin(request, storage, settings)) return jsonResponse({ error: 'Admin login required' }, 401);
         return jsonResponse({ ...publicSettings(settings), apiKeyConfigured: Boolean(settings.apiKeyHash || settings.apiKey || getAdminKey(env)) });
       }
 
       // Route: PUT /api/settings - Update settings (admin only)
       if (pathname === '/api/settings' && request.method === 'PUT') {
         if (!hasTrustedOrigin(request, settings)) return jsonResponse({ error: 'Untrusted request origin' }, 403);
-        if (!await isAdmin(request, env.url, settings)) return jsonResponse({ error: 'Admin login required' }, 401);
+        if (!await isAdmin(request, storage, settings)) return jsonResponse({ error: 'Admin login required' }, 401);
         let body;
         try { body = await request.json(); } catch { return jsonResponse({ error: 'Invalid JSON' }, 400); }
         const next = { ...settings };
@@ -1151,10 +1166,10 @@ export default {
           next.adminPasswordHash = await hashPassword(body.adminPassword);
           next.sessionVersion = (settings.sessionVersion || 1) + 1;
         }
-        await saveSettings(env.url, next);
+        await saveSettings(storage, next);
         const responseHeaders = {};
         if (body.adminPassword !== undefined) {
-          const session = await createSession(env.url, next.adminUsername, next.sessionVersion);
+          const session = await createSession(storage, next.adminUsername, next.sessionVersion);
           responseHeaders['Set-Cookie'] = `mvl27_session=${encodeURIComponent(session)}; Path=/; Max-Age=${SESSION_TTL}; HttpOnly; Secure; SameSite=Strict`;
         }
         return jsonResponse({ message: 'Settings saved', settings: publicSettings(next) }, 200, responseHeaders);
@@ -1179,12 +1194,12 @@ export default {
       // Route: POST /shorten - Create shortened URL with API Key
       if (pathname === '/shorten' && request.method === 'POST') {
         if (!hasTrustedOrigin(request, settings)) return jsonResponse({ error: 'Untrusted request origin' }, 403);
-        if (!await canCreateLink(request, settings, env, env.url)) {
+        if (!await canCreateLink(request, settings, env, storage)) {
           return jsonResponse({ error: 'Creation is not authorized. Sign in, provide the create password, or use an enabled API key.' }, 401);
         }
         
         // Rate limiting check
-        const rateLimit = await consumeRateLimit('shorten', request, env.url);
+        const rateLimit = await consumeRateLimit('shorten', request, storage);
         if (!rateLimit.allowed) {
           return jsonResponse({ error: 'Rate limit exceeded. Max 50 requests per hour' }, 429, {
             'Retry-After': String(rateLimit.retryAfter)
@@ -1232,7 +1247,7 @@ export default {
           return jsonResponse({ error: 'title must be a string of at most 120 characters' }, 400);
         }
 
-        const existing = await env.url.get(linkKey(slug)) || await env.url.get(slug);
+        const existing = await storage.get(linkKey(slug)) || await storage.get(slug);
         if (existing) {
           return addSecurityHeaders(new Response(
             JSON.stringify({ error: 'Slug already taken' }),
@@ -1250,7 +1265,7 @@ export default {
             expiresAt: null
           });
           
-          await env.url.put(linkKey(slug), linkData);
+          await storage.put(linkKey(slug), linkData);
           
           const shortUrl = `https://${settings.domain}/${slug}`;
           
@@ -1276,11 +1291,11 @@ export default {
       
       // Route: GET /api/stats - System Statistics
       if (pathname === '/api/stats' && request.method === 'GET') {
-        if (!await isAdmin(request, env.url, settings)) {
+        if (!await isAdmin(request, storage, settings)) {
           return jsonResponse({ error: 'Unauthorized: admin access required' }, 401);
         }
         try {
-          const keys = await listAllKeys(env.url);
+          const keys = await listAllKeys(storage);
           const totalLinks = keys.filter(k => isLinkKey(k.name)).length;
           
           return addSecurityHeaders(new Response(
@@ -1305,12 +1320,12 @@ export default {
       // Route: GET /api/links - List all shortened links
       if (pathname === '/api/links' && request.method === 'GET') {
         // Verify API Key for security
-        if (!await isAdmin(request, env.url, settings)) {
+        if (!await isAdmin(request, storage, settings)) {
           return jsonResponse({ error: 'Unauthorized: admin access required' }, 401);
         }
         
         // Apply rate limiting
-        const rateLimit = await consumeRateLimit('admin-list', request, env.url);
+        const rateLimit = await consumeRateLimit('admin-list', request, storage);
         if (!rateLimit.allowed) {
           return jsonResponse({ error: 'Rate limit exceeded' }, 429, {
             'Retry-After': String(rateLimit.retryAfter)
@@ -1318,14 +1333,14 @@ export default {
         }
         
         try {
-          const keys = await listAllKeys(env.url);
+          const keys = await listAllKeys(storage);
           const links = [];
           
           for (const key of keys) {
             const slug = getSlugFromLinkKey(key.name);
             if (!slug) continue;
             
-            const linkDataStr = await env.url.get(key.name);
+            const linkDataStr = await storage.get(key.name);
             if (linkDataStr) {
               try {
                 const linkData = JSON.parse(linkDataStr);
@@ -1367,19 +1382,19 @@ export default {
       // Route: DELETE /api/links - Delete all links (admin only)
       if (pathname === '/api/links' && request.method === 'DELETE') {
         if (!hasTrustedOrigin(request, settings)) return jsonResponse({ error: 'Untrusted request origin' }, 403);
-        if (!await isAdmin(request, env.url, settings)) {
+        if (!await isAdmin(request, storage, settings)) {
           return jsonResponse({ error: 'Unauthorized: admin access required' }, 401);
         }
-        const rateLimit = await consumeRateLimit('admin-delete-all', request, env.url);
+        const rateLimit = await consumeRateLimit('admin-delete-all', request, storage);
         if (!rateLimit.allowed) {
           return jsonResponse({ error: 'Rate limit exceeded' }, 429, {
             'Retry-After': String(rateLimit.retryAfter)
           });
         }
         try {
-          const keys = await listAllKeys(env.url);
+          const keys = await listAllKeys(storage);
           const linkKeys = keys.filter(key => isLinkKey(key.name));
-          await Promise.all(linkKeys.map(key => env.url.delete(key.name)));
+          await Promise.all(linkKeys.map(key => storage.delete(key.name)));
           return jsonResponse({ message: 'All links deleted successfully', deleted: linkKeys.length });
         } catch (error) {
           console.error('Error deleting all links:', error);
@@ -1390,12 +1405,12 @@ export default {
       // Route: DELETE /api/links/:slug - Delete link with API Key
       if (pathname.startsWith('/api/links/') && request.method === 'DELETE') {
         if (!hasTrustedOrigin(request, settings)) return jsonResponse({ error: 'Untrusted request origin' }, 403);
-        if (!await isAdmin(request, env.url, settings)) {
+        if (!await isAdmin(request, storage, settings)) {
           return jsonResponse({ error: 'Unauthorized: admin access required' }, 401);
         }
         
         // Apply rate limiting
-        const rateLimit = await consumeRateLimit('admin-delete', request, env.url);
+        const rateLimit = await consumeRateLimit('admin-delete', request, storage);
         if (!rateLimit.allowed) {
           return jsonResponse({ error: 'Rate limit exceeded' }, 429, {
             'Retry-After': String(rateLimit.retryAfter)
@@ -1414,7 +1429,7 @@ export default {
         
         try {
           const newKey = linkKey(slug);
-          const existing = await env.url.get(newKey) || await env.url.get(slug);
+          const existing = await storage.get(newKey) || await storage.get(slug);
           if (!existing) {
             return addSecurityHeaders(new Response(
               JSON.stringify({ error: 'Link not found' }),
@@ -1422,7 +1437,7 @@ export default {
             ));
           }
           
-          await Promise.all([env.url.delete(newKey), env.url.delete(slug)]);
+          await Promise.all([storage.delete(newKey), storage.delete(slug)]);
           
           return addSecurityHeaders(new Response(
             JSON.stringify({ message: 'Link deleted successfully', slug }),
@@ -1451,8 +1466,8 @@ export default {
         
         try {
           const newKey = linkKey(slug);
-          const storedKey = await env.url.get(newKey) ? newKey : slug;
-          const linkDataStr = await env.url.get(storedKey);
+          const storedKey = await storage.get(newKey) ? newKey : slug;
+          const linkDataStr = await storage.get(storedKey);
           
           if (!linkDataStr) {
             return addSecurityHeaders(new Response(generate404(settings), {
@@ -1483,7 +1498,7 @@ export default {
                   title: linkData.title || null,
                   expiresAt: linkData.expiresAt || null
                 });
-                await env.url.put(storedKey, updated, linkData.expiresAt ? {
+                await storage.put(storedKey, updated, linkData.expiresAt ? {
                   expiration: Math.floor(Date.parse(linkData.expiresAt) / 1000)
                 } : undefined);
               } catch (e) {
