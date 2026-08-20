@@ -12,6 +12,22 @@ const MAX_URL_LENGTH = 2048; // Prevent abuse
 const MAX_SLUG_LENGTH = 20;
 const MAX_EXPIRATION_DAYS = 365;
 const RESERVED_SLUGS = new Set(['api', 'links', 'shorten', 'favicon.ico']);
+const SETTINGS_KEY = 'system:settings';
+const SESSION_PREFIX = 'session:';
+const SESSION_TTL = 86400;
+const PASSWORD_MIN_LENGTH = 10;
+const DEFAULT_SETTINGS = {
+  initialized: false,
+  siteName: 'MVL27URL',
+  logoUrl: '',
+  domain: CUSTOM_DOMAIN,
+  apiEnabled: false,
+  apiKey: '',
+  apiKeyHash: null,
+  createPasswordHash: null,
+  adminUsername: '',
+  adminPasswordHash: null
+};
 const SECURITY_HEADERS = {
   'X-Content-Type-Options': 'nosniff',
   'X-Frame-Options': 'DENY',
@@ -96,9 +112,128 @@ function getAdminKey(env) {
   return typeof env.API_KEY === 'string' && env.API_KEY.length >= 16 ? env.API_KEY : null;
 }
 
-function isAdmin(request, env) {
-  const key = getAdminKey(env);
-  return Boolean(key && verifyApiKey(request, key));
+function getConfiguredApiKey(settings, env) {
+  return settings.apiEnabled ? (settings.apiKey || getAdminKey(env)) : null;
+}
+
+function randomBytes(size) {
+  const bytes = new Uint8Array(size);
+  crypto.getRandomValues(bytes);
+  return bytes;
+}
+
+function bytesToBase64(bytes) {
+  let binary = '';
+  bytes.forEach(byte => { binary += String.fromCharCode(byte); });
+  return btoa(binary);
+}
+
+function base64ToBytes(value) {
+  const binary = atob(value);
+  return Uint8Array.from(binary, character => character.charCodeAt(0));
+}
+
+async function hashPassword(password, salt = randomBytes(16)) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' }, key, 256);
+  return `${bytesToBase64(salt)}:${bytesToBase64(new Uint8Array(bits))}`;
+}
+
+async function verifyPassword(password, storedHash) {
+  if (typeof storedHash !== 'string' || !storedHash.includes(':')) return false;
+  const [salt] = storedHash.split(':');
+  try {
+    return (await hashPassword(password, base64ToBytes(salt))) === storedHash;
+  } catch {
+    return false;
+  }
+}
+
+async function hashApiKey(apiKey) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(apiKey));
+  return bytesToBase64(new Uint8Array(digest));
+}
+
+async function verifyConfiguredApiKey(request, settings, env) {
+  if (!settings.apiEnabled) return false;
+  const headerKey = request.headers.get('x-api-key');
+  if (!headerKey) return false;
+  if (settings.apiKeyHash) return (await hashApiKey(headerKey)) === settings.apiKeyHash;
+  const legacyKey = getConfiguredApiKey(settings, env);
+  return Boolean(legacyKey && headerKey === legacyKey);
+}
+
+async function loadSettings(storage, env) {
+  try {
+    const stored = await storage.get(SETTINGS_KEY);
+    if (stored) return { ...DEFAULT_SETTINGS, ...JSON.parse(stored) };
+  } catch (error) {
+    console.error('Error loading settings:', error);
+  }
+  const legacyApiKey = getAdminKey(env);
+  return { ...DEFAULT_SETTINGS, apiEnabled: Boolean(legacyApiKey), apiKey: legacyApiKey || '' };
+}
+
+async function saveSettings(storage, settings) {
+  await storage.put(SETTINGS_KEY, JSON.stringify(settings));
+}
+
+function getSessionToken(request) {
+  const cookie = request.headers.get('Cookie') || '';
+  const match = cookie.match(/(?:^|;\s*)mvl27_session=([^;]+)/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+async function createSession(storage, username) {
+  const token = bytesToBase64(randomBytes(32)).replace(/[/+=]/g, character => ({ '/': '_', '+': '-', '=': '' }[character]));
+  await storage.put(`${SESSION_PREFIX}${token}`, JSON.stringify({ username, createdAt: new Date().toISOString() }), { expirationTtl: SESSION_TTL });
+  return token;
+}
+
+async function isAdminSession(request, storage) {
+  const token = getSessionToken(request);
+  if (!token || !/^[A-Za-z0-9_-]{20,}$/.test(token)) return false;
+  try {
+    return Boolean(await storage.get(`${SESSION_PREFIX}${token}`));
+  } catch {
+    return false;
+  }
+}
+
+async function isAdmin(request, storage) {
+  return isAdminSession(request, storage);
+}
+
+async function canCreateLink(request, settings, env, storage) {
+  if (!settings.initialized) return false;
+  if (await isAdminSession(request, storage)) return true;
+  if (await verifyConfiguredApiKey(request, settings, env)) return true;
+  if (settings.createPasswordHash) {
+    const password = request.headers.get('x-create-password');
+    return Boolean(password && await verifyPassword(password, settings.createPasswordHash));
+  }
+  return false;
+}
+
+function isValidDomain(domain) {
+  if (typeof domain !== 'string' || domain.length > 253) return false;
+  try {
+    const parsed = new URL(`https://${domain}`);
+    return parsed.hostname === domain && !domain.includes('/') && !domain.includes('@');
+  } catch {
+    return false;
+  }
+}
+
+function publicSettings(settings) {
+  return {
+    initialized: Boolean(settings.initialized),
+    siteName: settings.siteName,
+    logoUrl: settings.logoUrl,
+    domain: settings.domain,
+    apiEnabled: Boolean(settings.apiEnabled),
+    createPasswordEnabled: Boolean(settings.createPasswordHash)
+  };
 }
 
 // Helper: Add security headers to response
@@ -109,7 +244,7 @@ function addSecurityHeaders(response) {
   });
   newHeaders.set('Access-Control-Allow-Origin', `https://${CUSTOM_DOMAIN}`);
   newHeaders.set('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-  newHeaders.set('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
+  newHeaders.set('Access-Control-Allow-Headers', 'Content-Type, x-api-key, x-create-password');
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
@@ -141,13 +276,13 @@ function verifyApiKey(request, apiKey) {
 }
 
 // Generate HTML Dashboard (Simplified)
-function generateDashboard() {
+function generateDashboard(settings = DEFAULT_SETTINGS) {
   return `<!DOCTYPE html>
 <html lang="vi">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MVL27URL</title>
+    <title>${escapeHtml(settings.siteName)}</title>
     <style>
         * {margin:0;padding:0;box-sizing:border-box}
         body {font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
@@ -184,8 +319,8 @@ function generateDashboard() {
 <body>
     <div class="container">
         <div class="header">
-            <div class="logo"><img src="https://ih.mvl27.bond/file/1787160909533_MVL27_NoBG.png" alt="MVL27URL" onerror="this.onerror=null;this.src='data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22120%22 height=%22120%22%3E%3Ctext x=%2250%25%22 y=%2250%25%22 font-size=%2248%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22%3E%F0%9F%9A%80%3C/text%3E%3C/svg%3E'"></div>
-            <div class="title">MVL27URL</div>
+            <div class="logo"><img src="${escapeHtml(settings.logoUrl || 'https://ih.mvl27.bond/file/1787160909533_MVL27_NoBG.png')}" alt="${escapeHtml(settings.siteName)}" onerror="this.style.display='none'"></div>
+            <div class="title">${escapeHtml(settings.siteName)}</div>
             <div class="subtitle">Make your URLs shorter, smarter & faster</div>
         </div>
         
@@ -205,15 +340,9 @@ function generateDashboard() {
             </div>
 
             <div class="form-group">
-              <label for="expiresInDays">Thời hạn (tùy chọn)</label>
-              <input type="number" id="expiresInDays" min="1" max="365" placeholder="Để trống nếu lưu vĩnh viễn">
-              <small>Tự động xóa sau 1 đến 365 ngày</small>
-            </div>
-            
-            <div class="form-group">
-                <label for="apiKey">API Key *</label>
-                <input type="password" id="apiKey" placeholder="Nhập API key của bạn" required>
-                <small>Cần API Key để tạo link rút gọn</small>
+                <label for="createCredential">API key hoặc mật khẩu tạo link</label>
+                <input type="password" id="createCredential" placeholder="Để trống nếu website cho phép công khai">
+                <small id="credentialHint">Nhập API key hoặc mật khẩu tạo link do admin cấp</small>
             </div>
             
             <button type="submit">Rút gọn URL</button>
@@ -260,27 +389,23 @@ function generateDashboard() {
             e.preventDefault();
             const url = document.getElementById('longUrl').value.trim();
             const slug = document.getElementById('customSlug').value.trim();
-            const expiresInDays = document.getElementById('expiresInDays').value;
-            const apiKey = document.getElementById('apiKey').value.trim();
+            const credential = document.getElementById('createCredential').value.trim();
             
             if (!url) {
                 showError('Vui lòng nhập URL');
                 return;
             }
             
-            if (!apiKey) {
-                showError('Vui lòng nhập API Key');
-                return;
-            }
-            
             try {
+              const headers = { 'Content-Type': 'application/json' };
+              if (credential) {
+                headers['x-api-key'] = credential;
+                headers['x-create-password'] = credential;
+              }
                 const res = await fetch('/shorten', {
                     method: 'POST',
-                    headers: { 
-                        'Content-Type': 'application/json',
-                        'x-api-key': apiKey
-                    },
-                    body: JSON.stringify({ url, slug: slug || undefined, expiresInDays: expiresInDays || undefined })
+                headers,
+                    body: JSON.stringify({ url, slug: slug || undefined })
                 });
                 
                 const data = await res.json();
@@ -319,13 +444,13 @@ function generateDashboard() {
 }
 
 // Generate Links Management Page
-function generateLinksPage() {
+function generateLinksPage(settings = DEFAULT_SETTINGS) {
   return `<!DOCTYPE html>
 <html lang="vi">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Quản lý Links - MVL27URL</title>
+    <title>Quản lý Links - ${escapeHtml(settings.siteName)}</title>
     <style>
         * {margin:0;padding:0;box-sizing:border-box}
         body {font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;padding:20px}
@@ -400,22 +525,24 @@ function generateLinksPage() {
 </head>
 <body>
     <div class="navbar">
-        <div class="navbar-brand"><img src="https://ih.mvl27.bond/file/1787160909533_MVL27_NoBG.png" alt="Logo" style="max-width:30px"> MVL27URL - Quản Lý</div>
+        <div class="navbar-brand"><img src="${escapeHtml(settings.logoUrl || 'https://ih.mvl27.bond/file/1787160909533_MVL27_NoBG.png')}" alt="Logo" style="max-width:30px"> ${escapeHtml(settings.siteName)} - Quản Lý</div>
         <button class="navbar-back" onclick="goHome()">← Quay lại</button>
     </div>
     
     <div class="container">
         <!-- Auth Panel -->
         <div class="auth-panel" id="authPanel">
-            <div class="auth-title">🔐 Xác Thực API Key</div>
-            <div class="auth-form">
-                <input type="password" id="apiKeyInput" placeholder="Nhập API key của bạn" autocomplete="off" />
-                <button onclick="authenticate()">Xem Links</button>
-            </div>
-            <div style="margin-top:15px;padding-top:15px;border-top:2px solid #e0e0e0;text-align:center;font-size:12px;color:#999">
-                <strong>⚠️ Lưu ý Bảo Mật:</strong><br>
-                API key được cấp bởi admin. <strong>KHÔNG chia sẻ</strong> với bất cứ ai. Chỉ nhập trên máy tính tin cậy.
-            </div>
+          <div class="auth-title" id="authTitle">🔐 Đăng nhập quản trị</div>
+          <div id="setupFields" style="display:none">
+            <div class="auth-form"><input type="text" id="setupUsername" placeholder="Tên tài khoản admin" autocomplete="username"><input type="password" id="setupPassword" placeholder="Mật khẩu admin (tối thiểu 10 ký tự)" autocomplete="new-password"></div>
+            <div class="auth-form" style="margin-top:10px"><input type="password" id="setupCreatePassword" placeholder="Mật khẩu tạo link (tùy chọn)" autocomplete="new-password"><input type="password" id="setupApiKey" placeholder="API key (tùy chọn, tối thiểu 16 ký tự)" autocomplete="new-password"></div>
+            <button onclick="completeSetup()" style="margin-top:10px">Thiết lập website</button>
+          </div>
+          <div id="loginFields">
+            <div class="auth-form"><input type="text" id="loginUsername" placeholder="Tên tài khoản" autocomplete="username"><input type="password" id="loginPassword" placeholder="Mật khẩu" autocomplete="current-password"><button onclick="authenticate()">Đăng nhập</button></div>
+          </div>
+          <div id="authMessage" class="msg error"></div>
+          <div style="margin-top:15px;padding-top:15px;border-top:2px solid #e0e0e0;text-align:center;font-size:12px;color:#999">Phiên quản trị được lưu bằng cookie HttpOnly và không dùng API key để đăng nhập.</div>
         </div>
         
         <!-- Content Panel -->
@@ -432,7 +559,7 @@ function generateLinksPage() {
             
             <div class="tabs">
                 <button class="tab-btn active" onclick="switchTab('links', this)">📋 Links</button>
-                <button class="tab-btn" onclick="switchTab('admin', this)">⚙️ Admin Panel</button>
+              <button class="tab-btn" onclick="switchTab('admin', this)">⚙️ Cài đặt</button>
             </div>
             
             <!-- Links Tab -->
@@ -499,7 +626,6 @@ function generateLinksPage() {
                     <div style="background:white;padding:15px;border-radius:6px;margin-bottom:15px">
                         <h4 style="margin-bottom:10px;font-size:14px">⚡ Quick Actions</h4>
                         <div class="admin-actions">
-                            <button class="admin-btn" style="background:#667eea;color:white" onclick="copyAdminApiKey(currentApiKey)">📋 Copy API Key</button>
                             <button class="admin-btn" style="background:#4caf50;color:white" onclick="refreshAdminStats()">🔄 Refresh Stats</button>
                             <button class="admin-btn" style="background:#ff6b6b;color:white" onclick="confirmClearAll()">🗑️ Clear All</button>
                         </div>
@@ -508,6 +634,17 @@ function generateLinksPage() {
                     <div style="background:#fff3cd;border-left:4px solid #ffc107;padding:12px;border-radius:6px;font-size:12px">
                         <strong>⚠️ Security Notice:</strong> Keep your API key safe. Never share it. Actions here affect all users.
                     </div>
+                    <form id="settingsForm" style="margin-top:20px" onsubmit="saveSettings(event)">
+                      <h4 style="margin-bottom:10px">Website settings</h4>
+                      <input id="siteName" placeholder="Tên website" maxlength="80" style="width:100%;padding:10px;margin-bottom:8px">
+                      <input id="logoUrl" placeholder="Logo URL (http/https)" style="width:100%;padding:10px;margin-bottom:8px">
+                      <input id="domain" placeholder="Domain, ví dụ short.example.com" style="width:100%;padding:10px;margin-bottom:8px">
+                      <label style="display:block;margin:8px 0"><input type="checkbox" id="apiEnabled"> Cho phép người khác dùng API key</label>
+                      <input id="apiKey" type="password" placeholder="API key mới (để trống để giữ nguyên)" style="width:100%;padding:10px;margin-bottom:8px">
+                      <input id="createPassword" type="password" placeholder="Mật khẩu tạo link mới (để trống giữ nguyên, nhập dấu - để tắt)" style="width:100%;padding:10px;margin-bottom:8px">
+                      <input id="adminPassword" type="password" placeholder="Mật khẩu admin mới (để trống giữ nguyên)" style="width:100%;padding:10px;margin-bottom:8px">
+                      <button type="submit" class="admin-btn" style="background:#667eea;color:white">Lưu settings</button>
+                    </form>
                 </div>
             </div>
         </div>
@@ -515,7 +652,7 @@ function generateLinksPage() {
     
     <script>
         let allLinks = [];
-        let currentApiKey = '';
+        let authenticated = false;
 
         function escapeHtml(text) {
           const map = {
@@ -538,12 +675,6 @@ function generateLinksPage() {
             if (tabName === 'admin') {
                 refreshAdminStats();
             }
-        }
-        
-        function copyAdminApiKey(key) {
-            navigator.clipboard.writeText(key).then(() => {
-                showSuccess('✓ API Key copied!');
-            });
         }
         
         function refreshAdminStats() {
@@ -569,7 +700,7 @@ function generateLinksPage() {
           try {
             const res = await fetch('/api/links', {
               method: 'DELETE',
-              headers: { 'x-api-key': currentApiKey }
+              credentials: 'same-origin'
             });
             const data = await res.json();
             if (!res.ok) {
@@ -589,56 +720,119 @@ function generateLinksPage() {
         }
         
         function showError(msg) {
-            const errorMsg = document.getElementById('errorMsg');
+          const errorMsg = document.getElementById('authPanel').style.display !== 'none'
+            ? document.getElementById('authMessage')
+            : document.getElementById('errorMsg');
             errorMsg.textContent = msg;
+          errorMsg.classList.remove('success');
+          errorMsg.classList.add('error');
             errorMsg.classList.add('show');
-            document.getElementById('successMsg').classList.remove('show');
+          document.getElementById('successMsg')?.classList.remove('show');
         }
         
         function showSuccess(msg) {
-            const successMsg = document.getElementById('successMsg');
+          const successMsg = document.getElementById('authPanel').style.display !== 'none'
+            ? document.getElementById('authMessage')
+            : document.getElementById('successMsg');
             successMsg.textContent = msg;
+          successMsg.classList.remove('error');
+          successMsg.classList.add('success');
             successMsg.classList.add('show');
-            document.getElementById('errorMsg').classList.remove('show');
+          document.getElementById('errorMsg')?.classList.remove('show');
         }
         
         async function authenticate() {
-            const apiKey = document.getElementById('apiKeyInput').value.trim();
-            if (!apiKey) {
-                showError('Vui lòng nhập API key');
-                return;
-            }
-            
             try {
-                const res = await fetch('/api/links', {
-                    headers: { 'x-api-key': apiKey }
+            const res = await fetch('/api/auth/login', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                username: document.getElementById('loginUsername').value.trim(),
+                password: document.getElementById('loginPassword').value
+              })
                 });
-                
                 if (!res.ok) {
-                    showError('API key không đúng');
+              showError((await res.json()).error || 'Đăng nhập thất bại');
                     return;
                 }
-                
-                const data = await res.json();
-                currentApiKey = apiKey;
-                allLinks = data.links || [];
-                
-                document.getElementById('authPanel').style.display = 'none';
-                document.getElementById('contentPanel').classList.add('active');
-                renderLinks();
-                refreshAdminStats();
+            await openAdmin();
             } catch (e) {
                 showError('Lỗi: ' + e.message);
             }
         }
+
+        async function completeSetup() {
+          try {
+            const apiKey = document.getElementById('setupApiKey').value.trim();
+            const res = await fetch('/api/setup', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                username: document.getElementById('setupUsername').value.trim(),
+                password: document.getElementById('setupPassword').value,
+                createPassword: document.getElementById('setupCreatePassword').value,
+                apiEnabled: Boolean(apiKey), apiKey
+              })
+            });
+            const data = await res.json();
+            if (!res.ok) { showError(data.error || 'Thiết lập thất bại'); return; }
+            await openAdmin();
+          } catch (e) { showError('Lỗi: ' + e.message); }
+        }
+
+        async function openAdmin() {
+          const res = await fetch('/api/links');
+          if (!res.ok) return false;
+          const data = await res.json();
+          authenticated = true;
+          allLinks = data.links || [];
+          document.getElementById('authPanel').style.display = 'none';
+          document.getElementById('contentPanel').classList.add('active');
+          renderLinks();
+          await loadSettings();
+            return true;
+        }
+
+        async function loadSettings() {
+          const res = await fetch('/api/settings');
+          if (!res.ok) return;
+          const data = await res.json();
+          document.getElementById('siteName').value = data.siteName || '';
+          document.getElementById('logoUrl').value = data.logoUrl || '';
+          document.getElementById('domain').value = data.domain || '';
+          document.getElementById('apiEnabled').checked = Boolean(data.apiEnabled);
+        }
+
+        async function saveSettings(event) {
+          event.preventDefault();
+          const body = {
+            siteName: document.getElementById('siteName').value,
+            logoUrl: document.getElementById('logoUrl').value,
+            domain: document.getElementById('domain').value,
+            apiEnabled: document.getElementById('apiEnabled').checked
+          };
+          const apiKey = document.getElementById('apiKey').value;
+          const createPassword = document.getElementById('createPassword').value;
+          const adminPassword = document.getElementById('adminPassword').value;
+          if (apiKey) body.apiKey = apiKey;
+          if (createPassword) body.createPassword = createPassword === '-' ? '' : createPassword;
+          if (adminPassword) body.adminPassword = adminPassword;
+          const res = await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+          const data = await res.json();
+          if (!res.ok) { showError(data.error || 'Không thể lưu settings'); return; }
+          showSuccess('Đã lưu settings');
+          document.getElementById('apiKey').value = '';
+          document.getElementById('createPassword').value = '';
+          document.getElementById('adminPassword').value = '';
+        }
         
         function logout() {
-            currentApiKey = '';
+          fetch('/api/auth/logout', { method: 'POST' });
+          authenticated = false;
             allLinks = [];
             document.getElementById('authPanel').style.display = 'block';
             document.getElementById('contentPanel').classList.remove('active');
-            document.getElementById('apiKeyInput').value = '';
-            document.getElementById('apiKeyInput').focus();
+            document.getElementById('loginPassword').value = '';
+            document.getElementById('loginUsername').focus();
         }
         
         function renderLinks() {
@@ -724,7 +918,7 @@ function generateLinksPage() {
             try {
                 const res = await fetch('/api/links/' + slug, {
                     method: 'DELETE',
-                    headers: { 'x-api-key': currentApiKey }
+                    credentials: 'same-origin'
                 });
                 
                 if (!res.ok) {
@@ -740,21 +934,29 @@ function generateLinksPage() {
             }
         }
         
-        // Focus input on load
-        document.getElementById('apiKeyInput').focus();
+        async function initializeAuth() {
+          const status = await fetch('/api/setup-status').then(response => response.json());
+          document.getElementById('setupFields').style.display = status.initialized ? 'none' : 'block';
+          document.getElementById('loginFields').style.display = status.initialized ? 'block' : 'none';
+          document.getElementById('authTitle').textContent = status.initialized ? '🔐 Đăng nhập quản trị' : '🚀 Thiết lập lần đầu';
+          if (!status.initialized) return;
+            try { await openAdmin(); } catch {}
+            document.getElementById('loginUsername').focus();
+        }
+        initializeAuth();
     </script>
 </body>
 </html>`;
 }
 
 // Generate 404 page
-function generate404() {
+function generate404(settings = DEFAULT_SETTINGS) {
   return `<!DOCTYPE html>
 <html lang="vi">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>404 - MVL27URL</title>
+    <title>404 - ${escapeHtml(settings.siteName)}</title>
     <style>
         * {margin:0;padding:0;box-sizing:border-box}
         body {font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
@@ -771,7 +973,7 @@ function generate404() {
 <body>
     <div class="container">
         <div style="text-align:center;margin-bottom:20px">
-            <img src="https://ih.mvl27.bond/file/1787160909533_MVL27_NoBG.png" alt="Logo" style="max-width:80px;height:auto" onerror="this.onerror=null;this.style.display='none'">
+            <img src="${escapeHtml(settings.logoUrl || 'https://ih.mvl27.bond/file/1787160909533_MVL27_NoBG.png')}" alt="${escapeHtml(settings.siteName)}" style="max-width:80px;height:auto" onerror="this.onerror=null;this.style.display='none'">
         </div>
         <div class="emoji">😕</div>
         <div class="error-code">404</div>
@@ -781,7 +983,7 @@ function generate404() {
             Vui lòng kiểm tra lại slug.
         </div>
         <a href="/" class="button">Quay lại Dashboard</a>
-        <div class="brand">MVL27URL 🚀</div>
+        <div class="brand">${escapeHtml(settings.siteName)}</div>
     </div>
 </body>
 </html>`;
@@ -792,7 +994,6 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const pathname = url.pathname;
-    const apiKey = getAdminKey(env);
     
     // Handle CORS preflight
     if (request.method === 'OPTIONS') {
@@ -800,9 +1001,116 @@ export default {
     }
     
     try {
+      const settings = await loadSettings(env.url, env);
+
+      // Route: GET /api/setup-status - Initial setup and public configuration
+      if (pathname === '/api/setup-status' && request.method === 'GET') {
+        return jsonResponse(publicSettings(settings));
+      }
+
+      // Route: POST /api/setup - One-time administrator setup
+      if (pathname === '/api/setup' && request.method === 'POST') {
+        if (settings.initialized) return jsonResponse({ error: 'Setup has already been completed' }, 409);
+        let body;
+        try { body = await request.json(); } catch { return jsonResponse({ error: 'Invalid JSON' }, 400); }
+        const { username, password, createPassword, apiEnabled = false, apiKey = '', siteName = DEFAULT_SETTINGS.siteName, logoUrl = '', domain = CUSTOM_DOMAIN } = body || {};
+        if (typeof username !== 'string' || !/^[A-Za-z0-9_.-]{3,40}$/.test(username)) return jsonResponse({ error: 'Username must be 3-40 characters' }, 400);
+        if (typeof password !== 'string' || password.length < PASSWORD_MIN_LENGTH) return jsonResponse({ error: `Admin password must be at least ${PASSWORD_MIN_LENGTH} characters` }, 400);
+        if (createPassword !== undefined && createPassword !== '' && (typeof createPassword !== 'string' || createPassword.length < PASSWORD_MIN_LENGTH)) return jsonResponse({ error: `Create password must be empty or at least ${PASSWORD_MIN_LENGTH} characters` }, 400);
+        if (apiEnabled && (typeof apiKey !== 'string' || apiKey.length < 16)) return jsonResponse({ error: 'API key must be at least 16 characters when enabled' }, 400);
+        if (typeof siteName !== 'string' || siteName.trim().length < 1 || siteName.length > 80) return jsonResponse({ error: 'Invalid site name' }, 400);
+        if (logoUrl && !isValidUrl(logoUrl)) return jsonResponse({ error: 'Logo URL must be a valid http/https URL' }, 400);
+        if (!isValidDomain(domain)) return jsonResponse({ error: 'Invalid domain' }, 400);
+        const newSettings = {
+          ...DEFAULT_SETTINGS,
+          initialized: true,
+          siteName: siteName.trim(),
+          logoUrl: logoUrl.trim(),
+          domain: domain.toLowerCase(),
+          apiEnabled: Boolean(apiEnabled),
+          apiKey: '',
+          apiKeyHash: apiEnabled ? await hashApiKey(apiKey) : null,
+          adminUsername: username,
+          adminPasswordHash: await hashPassword(password),
+          createPasswordHash: createPassword ? await hashPassword(createPassword) : null
+        };
+        await saveSettings(env.url, newSettings);
+        const session = await createSession(env.url, username);
+        return jsonResponse({ message: 'Setup completed', settings: publicSettings(newSettings) }, 201, {
+          'Set-Cookie': `mvl27_session=${encodeURIComponent(session)}; Path=/; Max-Age=${SESSION_TTL}; HttpOnly; Secure; SameSite=Strict`
+        });
+      }
+
+      // Route: POST /api/auth/login - Administrator login
+      if (pathname === '/api/auth/login' && request.method === 'POST') {
+        if (!settings.initialized) return jsonResponse({ error: 'Complete initial setup first' }, 428);
+        const loginLimit = await consumeRateLimit('admin-login', request, env.url);
+        if (!loginLimit.allowed) return jsonResponse({ error: 'Too many login attempts' }, 429, { 'Retry-After': String(loginLimit.retryAfter) });
+        let body;
+        try { body = await request.json(); } catch { return jsonResponse({ error: 'Invalid JSON' }, 400); }
+        if (typeof body?.username !== 'string' || typeof body?.password !== 'string' || body.username !== settings.adminUsername || !(await verifyPassword(body.password, settings.adminPasswordHash))) {
+          return jsonResponse({ error: 'Invalid username or password' }, 401);
+        }
+        const session = await createSession(env.url, settings.adminUsername);
+        return jsonResponse({ message: 'Login successful', settings: publicSettings(settings) }, 200, {
+          'Set-Cookie': `mvl27_session=${encodeURIComponent(session)}; Path=/; Max-Age=${SESSION_TTL}; HttpOnly; Secure; SameSite=Strict`
+        });
+      }
+
+      // Route: POST /api/auth/logout - End administrator session
+      if (pathname === '/api/auth/logout' && request.method === 'POST') {
+        const token = getSessionToken(request);
+        if (token) await env.url.delete(`${SESSION_PREFIX}${token}`);
+        return jsonResponse({ message: 'Logged out' }, 200, {
+          'Set-Cookie': 'mvl27_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict'
+        });
+      }
+
+      // Route: GET /api/settings - Read settings (admin only)
+      if (pathname === '/api/settings' && request.method === 'GET') {
+        if (!await isAdmin(request, env.url)) return jsonResponse({ error: 'Admin login required' }, 401);
+        return jsonResponse({ ...publicSettings(settings), apiKeyConfigured: Boolean(settings.apiKeyHash || settings.apiKey || getAdminKey(env)) });
+      }
+
+      // Route: PUT /api/settings - Update settings (admin only)
+      if (pathname === '/api/settings' && request.method === 'PUT') {
+        if (!await isAdmin(request, env.url)) return jsonResponse({ error: 'Admin login required' }, 401);
+        let body;
+        try { body = await request.json(); } catch { return jsonResponse({ error: 'Invalid JSON' }, 400); }
+        const next = { ...settings };
+        if (body.siteName !== undefined) {
+          if (typeof body.siteName !== 'string' || !body.siteName.trim() || body.siteName.length > 80) return jsonResponse({ error: 'Invalid site name' }, 400);
+          next.siteName = body.siteName.trim();
+        }
+        if (body.logoUrl !== undefined) {
+          if (body.logoUrl && !isValidUrl(body.logoUrl)) return jsonResponse({ error: 'Logo URL must be a valid http/https URL' }, 400);
+          next.logoUrl = body.logoUrl.trim();
+        }
+        if (body.domain !== undefined) {
+          if (!isValidDomain(body.domain)) return jsonResponse({ error: 'Invalid domain' }, 400);
+          next.domain = body.domain.toLowerCase();
+        }
+        if (body.apiEnabled !== undefined) next.apiEnabled = Boolean(body.apiEnabled);
+        if (body.apiKey !== undefined && body.apiKey !== '') {
+          if (typeof body.apiKey !== 'string' || body.apiKey.length < 16) return jsonResponse({ error: 'API key must be at least 16 characters' }, 400);
+          next.apiKey = '';
+          next.apiKeyHash = await hashApiKey(body.apiKey);
+        }
+        if (body.createPassword !== undefined) {
+          if (body.createPassword && (typeof body.createPassword !== 'string' || body.createPassword.length < PASSWORD_MIN_LENGTH)) return jsonResponse({ error: `Create password must be empty or at least ${PASSWORD_MIN_LENGTH} characters` }, 400);
+          next.createPasswordHash = body.createPassword ? await hashPassword(body.createPassword) : null;
+        }
+        if (body.adminPassword !== undefined) {
+          if (typeof body.adminPassword !== 'string' || body.adminPassword.length < PASSWORD_MIN_LENGTH) return jsonResponse({ error: `Admin password must be at least ${PASSWORD_MIN_LENGTH} characters` }, 400);
+          next.adminPasswordHash = await hashPassword(body.adminPassword);
+        }
+        await saveSettings(env.url, next);
+        return jsonResponse({ message: 'Settings saved', settings: publicSettings(next) });
+      }
+
       // Route: GET / - Dashboard
       if (pathname === '/' && request.method === 'GET') {
-        return addSecurityHeaders(new Response(generateDashboard(), {
+        return addSecurityHeaders(new Response(generateDashboard(settings), {
           headers: { 'Content-Type': 'text/html; charset=utf-8' },
           status: 200
         }));
@@ -810,7 +1118,7 @@ export default {
       
       // Route: GET /links - Links Management Page (MUST come before /:slug)
       if (pathname === '/links' && request.method === 'GET') {
-        return addSecurityHeaders(new Response(generateLinksPage(), {
+        return addSecurityHeaders(new Response(generateLinksPage(settings), {
           headers: { 'Content-Type': 'text/html; charset=utf-8' },
           status: 200
         }));
@@ -818,9 +1126,8 @@ export default {
       
       // Route: POST /shorten - Create shortened URL with API Key
       if (pathname === '/shorten' && request.method === 'POST') {
-        // Verify API Key
-        if (!apiKey || !verifyApiKey(request, apiKey)) {
-          return jsonResponse({ error: 'Unauthorized: Invalid or missing API key' }, 401);
+        if (!await canCreateLink(request, settings, env, env.url)) {
+          return jsonResponse({ error: 'Creation is not authorized. Sign in, provide the create password, or use an enabled API key.' }, 401);
         }
         
         // Rate limiting check
@@ -841,7 +1148,7 @@ export default {
           ));
         }
         
-        const { url: longUrl, slug: customSlug, expiresInDays, title } = body;
+        const { url: longUrl, slug: customSlug, title } = body;
         
         if (!longUrl || typeof longUrl !== 'string') {
           return addSecurityHeaders(new Response(
@@ -868,12 +1175,6 @@ export default {
           ));
         }
         
-        const expirationDays = expiresInDays === undefined || expiresInDays === null || expiresInDays === ''
-          ? null
-          : Number(expiresInDays);
-        if (expirationDays !== null && (!Number.isInteger(expirationDays) || expirationDays < 1 || expirationDays > MAX_EXPIRATION_DAYS)) {
-          return jsonResponse({ error: `expiresInDays must be an integer from 1 to ${MAX_EXPIRATION_DAYS}` }, 400);
-        }
         if (title !== undefined && (typeof title !== 'string' || title.length > 120)) {
           return jsonResponse({ error: 'title must be a string of at most 120 characters' }, 400);
         }
@@ -888,18 +1189,17 @@ export default {
         
         try {
           const createdAt = new Date().toISOString();
-          const expiresAt = expirationDays ? new Date(Date.now() + expirationDays * 86400000).toISOString() : null;
           const linkData = JSON.stringify({
             url: normalizedUrl,
             created: createdAt,
             clicks: 0,
             title: title ? title.trim() : null,
-            expiresAt
+            expiresAt: null
           });
           
-          await env.url.put(slug, linkData, expirationDays ? { expirationTtl: expirationDays * 86400 } : undefined);
+          await env.url.put(slug, linkData);
           
-          const shortUrl = `https://${CUSTOM_DOMAIN}/${slug}`;
+          const shortUrl = `https://${settings.domain}/${slug}`;
           
           return addSecurityHeaders(new Response(
             JSON.stringify({
@@ -908,7 +1208,7 @@ export default {
               originalUrl: normalizedUrl,
               permanent: true,
               createdAt,
-              expiresAt
+              expiresAt: null
             }),
             { status: 200, headers: { 'Content-Type': 'application/json' } }
           ));
@@ -923,7 +1223,7 @@ export default {
       
       // Route: GET /api/stats - System Statistics
       if (pathname === '/api/stats' && request.method === 'GET') {
-        if (!isAdmin(request, env)) {
+        if (!await isAdmin(request, env.url)) {
           return jsonResponse({ error: 'Unauthorized: admin access required' }, 401);
         }
         try {
@@ -934,7 +1234,7 @@ export default {
             JSON.stringify({
               total_links: totalLinks,
               system_status: 'active',
-              domain: CUSTOM_DOMAIN,
+              domain: settings.domain,
               storage: 'permanent',
               timestamp: new Date().toISOString()
             }),
@@ -952,7 +1252,7 @@ export default {
       // Route: GET /api/links - List all shortened links
       if (pathname === '/api/links' && request.method === 'GET') {
         // Verify API Key for security
-        if (!isAdmin(request, env)) {
+        if (!await isAdmin(request, env.url)) {
           return jsonResponse({ error: 'Unauthorized: admin access required' }, 401);
         }
         
@@ -978,7 +1278,7 @@ export default {
                 const linkData = JSON.parse(linkDataStr);
                 links.push({
                   slug: key.name,
-                  shortUrl: `https://${CUSTOM_DOMAIN}/${encodeURIComponent(key.name)}`,
+                  shortUrl: `https://${settings.domain}/${encodeURIComponent(key.name)}`,
                   originalUrl: linkData.url,
                   createdAt: linkData.created,
                   clicks: linkData.clicks || 0,
@@ -1013,7 +1313,7 @@ export default {
 
       // Route: DELETE /api/links - Delete all links (admin only)
       if (pathname === '/api/links' && request.method === 'DELETE') {
-        if (!isAdmin(request, env)) {
+        if (!await isAdmin(request, env.url)) {
           return jsonResponse({ error: 'Unauthorized: admin access required' }, 401);
         }
         const rateLimit = await consumeRateLimit('admin-delete-all', request, env.url);
@@ -1035,7 +1335,7 @@ export default {
       
       // Route: DELETE /api/links/:slug - Delete link with API Key
       if (pathname.startsWith('/api/links/') && request.method === 'DELETE') {
-        if (!isAdmin(request, env)) {
+        if (!await isAdmin(request, env.url)) {
           return jsonResponse({ error: 'Unauthorized: admin access required' }, 401);
         }
         
@@ -1087,7 +1387,7 @@ export default {
         
         // Validate slug format
         if (!isValidSlug(slug)) {
-          return addSecurityHeaders(new Response(generate404(), {
+          return addSecurityHeaders(new Response(generate404(settings), {
             status: 404,
             headers: { 'Content-Type': 'text/html; charset=utf-8' }
           }));
@@ -1097,7 +1397,7 @@ export default {
           const linkDataStr = await env.url.get(slug);
           
           if (!linkDataStr) {
-            return addSecurityHeaders(new Response(generate404(), {
+            return addSecurityHeaders(new Response(generate404(settings), {
               status: 404,
               headers: { 'Content-Type': 'text/html; charset=utf-8' }
             }));
@@ -1106,17 +1406,9 @@ export default {
           const linkData = JSON.parse(linkDataStr);
           const longUrl = linkData.url;
 
-          if (linkData.expiresAt && Date.now() >= Date.parse(linkData.expiresAt)) {
-            ctx.waitUntil(env.url.delete(slug));
-            return addSecurityHeaders(new Response(generate404(), {
-              status: 404,
-              headers: { 'Content-Type': 'text/html; charset=utf-8' }
-            }));
-          }
-          
           // Validate URL exists and is valid
           if (!longUrl || typeof longUrl !== 'string' || !isValidUrl(longUrl)) {
-            return addSecurityHeaders(new Response(generate404(), {
+            return addSecurityHeaders(new Response(generate404(settings), {
               status: 404,
               headers: { 'Content-Type': 'text/html; charset=utf-8' }
             }));
@@ -1150,7 +1442,7 @@ export default {
           return addSecurityHeaders(response);
         } catch (error) {
           console.error('Error processing redirect:', error);
-          return addSecurityHeaders(new Response(generate404(), {
+          return addSecurityHeaders(new Response(generate404(settings), {
             status: 404,
             headers: { 'Content-Type': 'text/html; charset=utf-8' }
           }));
@@ -1158,7 +1450,7 @@ export default {
       }
       
       // Default: 404
-      return addSecurityHeaders(new Response(generate404(), {
+      return addSecurityHeaders(new Response(generate404(settings), {
         status: 404,
         headers: { 'Content-Type': 'text/html; charset=utf-8' }
       }));
