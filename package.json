@@ -1,0 +1,13 @@
+{
+  "name": "mvl27url",
+  "private": true,
+  "version": "1.0.0",
+  "description": "A configurable Cloudflare URL shortener Worker",
+  "scripts": {
+    "check": "node --check worker.js",
+    "build:pages": "node scripts/build-pages.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "latest"
+  }
+}

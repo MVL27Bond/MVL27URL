@@ -1,0 +1,14 @@
+name = "mvl27url"
+main = "worker.js"
+compatibility_date = "2026-08-20"
+
+# Replace the placeholder with the namespace ID returned by:
+# npx wrangler kv namespace create URLS
+[[kv_namespaces]]
+binding = "url"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# Optional legacy secret. New installations configure access in /links.
+# Set it with: npx wrangler secret put API_KEY
+# Optional bootstrap protection for first-time setup:
+# npx wrangler secret put SETUP_KEY
