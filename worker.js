@@ -9,6 +9,9 @@ const CUSTOM_DOMAIN = 'url.mvl27.bond';
 const RATE_LIMIT_REQUESTS = 50;
 const RATE_LIMIT_WINDOW = 3600; // 1 hour
 const MAX_URL_LENGTH = 2048; // Prevent abuse
+const MAX_SLUG_LENGTH = 20;
+const MAX_EXPIRATION_DAYS = 365;
+const RESERVED_SLUGS = new Set(['api', 'links', 'shorten', 'favicon.ico']);
 const SECURITY_HEADERS = {
   'X-Content-Type-Options': 'nosniff',
   'X-Frame-Options': 'DENY',
@@ -20,9 +23,11 @@ const SECURITY_HEADERS = {
 // Helper: Generate random slug if not provided
 function generateSlug() {
   const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  const random = new Uint8Array(8);
+  crypto.getRandomValues(random);
   let slug = '';
-  for (let i = 0; i < 6; i++) {
-    slug += chars.charAt(Math.floor(Math.random() * chars.length));
+  for (let i = 0; i < 8; i++) {
+    slug += chars[random[i] % chars.length];
   }
   return slug;
 }
@@ -30,9 +35,9 @@ function generateSlug() {
 // Helper: Validate URL format
 function isValidUrl(url) {
   try {
-    if (url.length > MAX_URL_LENGTH) return false;
-    new URL(url);
-    return true;
+    if (typeof url !== 'string' || url.length > MAX_URL_LENGTH) return false;
+    const parsed = new URL(url);
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && !parsed.username && !parsed.password;
   } catch {
     return false;
   }
@@ -40,7 +45,60 @@ function isValidUrl(url) {
 
 // Helper: Validate slug format
 function isValidSlug(slug) {
-  return /^[-a-zA-Z0-9_]{1,20}$/.test(slug) && slug.length > 0;
+  return typeof slug === 'string' && slug.length <= MAX_SLUG_LENGTH && /^[-a-zA-Z0-9_]+$/.test(slug) && !RESERVED_SLUGS.has(slug.toLowerCase());
+}
+
+function jsonResponse(data, status = 200, headers = {}) {
+  return addSecurityHeaders(new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', ...headers }
+  }));
+}
+
+async function consumeRateLimit(namespace, request, storage) {
+  const clientIP = getClientIP(request);
+  const key = `ratelimit:${namespace}:${clientIP}`;
+  const now = Math.floor(Date.now() / 1000);
+  let info = { count: 0, resetTime: now + RATE_LIMIT_WINDOW };
+
+  try {
+    const stored = await storage.get(key);
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      if (Number.isInteger(parsed.count) && Number.isInteger(parsed.resetTime)) info = parsed;
+    }
+  } catch (error) {
+    console.error('Error reading rate limit:', error);
+  }
+
+  if (now >= info.resetTime) info = { count: 0, resetTime: now + RATE_LIMIT_WINDOW };
+  if (info.count >= RATE_LIMIT_REQUESTS) {
+    return { allowed: false, retryAfter: Math.max(1, info.resetTime - now) };
+  }
+
+  info.count += 1;
+  await storage.put(key, JSON.stringify(info), { expirationTtl: RATE_LIMIT_WINDOW + 10 });
+  return { allowed: true, retryAfter: info.resetTime - now };
+}
+
+async function listAllKeys(storage) {
+  const keys = [];
+  let cursor;
+  do {
+    const page = await storage.list(cursor ? { cursor } : undefined);
+    keys.push(...page.keys);
+    cursor = page.list_complete ? null : page.cursor;
+  } while (cursor);
+  return keys;
+}
+
+function getAdminKey(env) {
+  return typeof env.API_KEY === 'string' && env.API_KEY.length >= 16 ? env.API_KEY : null;
+}
+
+function isAdmin(request, env) {
+  const key = getAdminKey(env);
+  return Boolean(key && verifyApiKey(request, key));
 }
 
 // Helper: Add security headers to response
@@ -49,7 +107,7 @@ function addSecurityHeaders(response) {
   Object.entries(SECURITY_HEADERS).forEach(([key, value]) => {
     newHeaders.set(key, value);
   });
-  newHeaders.set('Access-Control-Allow-Origin', '*');
+  newHeaders.set('Access-Control-Allow-Origin', `https://${CUSTOM_DOMAIN}`);
   newHeaders.set('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   newHeaders.set('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
   return new Response(response.body, {
@@ -145,6 +203,12 @@ function generateDashboard() {
                 <input type="text" id="customSlug" placeholder="ví dụ: my-link">
                 <small>Chỉ chữ cái, số, gạch nối và dấu gạch dưới (tối đa 20 ký tự)</small>
             </div>
+
+            <div class="form-group">
+              <label for="expiresInDays">Thời hạn (tùy chọn)</label>
+              <input type="number" id="expiresInDays" min="1" max="365" placeholder="Để trống nếu lưu vĩnh viễn">
+              <small>Tự động xóa sau 1 đến 365 ngày</small>
+            </div>
             
             <div class="form-group">
                 <label for="apiKey">API Key *</label>
@@ -196,6 +260,7 @@ function generateDashboard() {
             e.preventDefault();
             const url = document.getElementById('longUrl').value.trim();
             const slug = document.getElementById('customSlug').value.trim();
+            const expiresInDays = document.getElementById('expiresInDays').value;
             const apiKey = document.getElementById('apiKey').value.trim();
             
             if (!url) {
@@ -215,7 +280,7 @@ function generateDashboard() {
                         'Content-Type': 'application/json',
                         'x-api-key': apiKey
                     },
-                    body: JSON.stringify({ url, slug: slug || undefined })
+                    body: JSON.stringify({ url, slug: slug || undefined, expiresInDays: expiresInDays || undefined })
                 });
                 
                 const data = await res.json();
@@ -501,7 +566,22 @@ function generateLinksPage() {
         }
         
         async function clearAllLinks() {
-            showError('This feature requires admin authentication');
+          try {
+            const res = await fetch('/api/links', {
+              method: 'DELETE',
+              headers: { 'x-api-key': currentApiKey }
+            });
+            const data = await res.json();
+            if (!res.ok) {
+              showError(data.error || 'Không thể xóa links');
+              return;
+            }
+            allLinks = [];
+            renderLinks();
+            showSuccess('Đã xóa ' + data.deleted + ' links');
+          } catch (e) {
+            showError('Lỗi: ' + e.message);
+          }
         }
         
         function goHome() {
@@ -712,8 +792,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const pathname = url.pathname;
-    const clientIP = getClientIP(request);
-    const apiKey = env.API_KEY || 'default-secret-key';
+    const apiKey = getAdminKey(env);
     
     // Handle CORS preflight
     if (request.method === 'OPTIONS') {
@@ -740,39 +819,17 @@ export default {
       // Route: POST /shorten - Create shortened URL with API Key
       if (pathname === '/shorten' && request.method === 'POST') {
         // Verify API Key
-        if (!verifyApiKey(request, apiKey)) {
-          return addSecurityHeaders(new Response(
-            JSON.stringify({ error: 'Unauthorized: Invalid or missing API key' }),
-            { status: 401, headers: { 'Content-Type': 'application/json' } }
-          ));
+        if (!apiKey || !verifyApiKey(request, apiKey)) {
+          return jsonResponse({ error: 'Unauthorized: Invalid or missing API key' }, 401);
         }
         
         // Rate limiting check
-        const rateLimitKey = `ratelimit:${clientIP}`;
-        const rateLimitData = await env.url.get(rateLimitKey);
-        const now = Math.floor(Date.now() / 1000);
-        
-        let rateLimitInfo = { count: 0, resetTime: now + RATE_LIMIT_WINDOW };
-        if (rateLimitData) {
-          rateLimitInfo = JSON.parse(rateLimitData);
-          if (now < rateLimitInfo.resetTime && rateLimitInfo.count >= RATE_LIMIT_REQUESTS) {
-            return addSecurityHeaders(new Response(
-              JSON.stringify({ error: 'Rate limit exceeded. Max 50 requests per hour' }),
-              { status: 429, headers: { 'Content-Type': 'application/json' } }
-            ));
-          }
-          if (now >= rateLimitInfo.resetTime) {
-            rateLimitInfo = { count: 1, resetTime: now + RATE_LIMIT_WINDOW };
-          } else {
-            rateLimitInfo.count++;
-          }
-        } else {
-          rateLimitInfo = { count: 1, resetTime: now + RATE_LIMIT_WINDOW };
+        const rateLimit = await consumeRateLimit('shorten', request, env.url);
+        if (!rateLimit.allowed) {
+          return jsonResponse({ error: 'Rate limit exceeded. Max 50 requests per hour' }, 429, {
+            'Retry-After': String(rateLimit.retryAfter)
+          });
         }
-        
-        await env.url.put(rateLimitKey, JSON.stringify(rateLimitInfo), { 
-          expirationTtl: RATE_LIMIT_WINDOW + 10 
-        });
         
         let body;
         try {
@@ -784,7 +841,7 @@ export default {
           ));
         }
         
-        const { url: longUrl, slug: customSlug } = body;
+        const { url: longUrl, slug: customSlug, expiresInDays, title } = body;
         
         if (!longUrl || typeof longUrl !== 'string') {
           return addSecurityHeaders(new Response(
@@ -793,7 +850,8 @@ export default {
           ));
         }
         
-        if (!isValidUrl(longUrl)) {
+        const normalizedUrl = longUrl.trim();
+        if (!isValidUrl(normalizedUrl)) {
           return addSecurityHeaders(new Response(
             JSON.stringify({ error: 'Invalid URL format or URL too long (max 2048 chars)' }),
             { status: 400, headers: { 'Content-Type': 'application/json' } }
@@ -801,14 +859,25 @@ export default {
         }
         
         let slug = customSlug || generateSlug();
+        if (typeof slug === 'string') slug = slug.trim();
         
-        if (!isValidSlug(slug)) {
+        if (!isValidSlug(slug) || slug.length > MAX_SLUG_LENGTH) {
           return addSecurityHeaders(new Response(
             JSON.stringify({ error: 'Invalid slug format. Max 20 chars, alphanumeric, hyphens, underscores only' }),
             { status: 400, headers: { 'Content-Type': 'application/json' } }
           ));
         }
         
+        const expirationDays = expiresInDays === undefined || expiresInDays === null || expiresInDays === ''
+          ? null
+          : Number(expiresInDays);
+        if (expirationDays !== null && (!Number.isInteger(expirationDays) || expirationDays < 1 || expirationDays > MAX_EXPIRATION_DAYS)) {
+          return jsonResponse({ error: `expiresInDays must be an integer from 1 to ${MAX_EXPIRATION_DAYS}` }, 400);
+        }
+        if (title !== undefined && (typeof title !== 'string' || title.length > 120)) {
+          return jsonResponse({ error: 'title must be a string of at most 120 characters' }, 400);
+        }
+
         const existing = await env.url.get(slug);
         if (existing) {
           return addSecurityHeaders(new Response(
@@ -818,13 +887,17 @@ export default {
         }
         
         try {
+          const createdAt = new Date().toISOString();
+          const expiresAt = expirationDays ? new Date(Date.now() + expirationDays * 86400000).toISOString() : null;
           const linkData = JSON.stringify({
-            url: longUrl,
-            created: new Date().toISOString(),
-            clicks: 0
+            url: normalizedUrl,
+            created: createdAt,
+            clicks: 0,
+            title: title ? title.trim() : null,
+            expiresAt
           });
           
-          await env.url.put(slug, linkData);
+          await env.url.put(slug, linkData, expirationDays ? { expirationTtl: expirationDays * 86400 } : undefined);
           
           const shortUrl = `https://${CUSTOM_DOMAIN}/${slug}`;
           
@@ -832,9 +905,10 @@ export default {
             JSON.stringify({
               slug,
               shortUrl,
-              originalUrl: longUrl,
+              originalUrl: normalizedUrl,
               permanent: true,
-              createdAt: new Date().toISOString()
+              createdAt,
+              expiresAt
             }),
             { status: 200, headers: { 'Content-Type': 'application/json' } }
           ));
@@ -849,9 +923,12 @@ export default {
       
       // Route: GET /api/stats - System Statistics
       if (pathname === '/api/stats' && request.method === 'GET') {
+        if (!isAdmin(request, env)) {
+          return jsonResponse({ error: 'Unauthorized: admin access required' }, 401);
+        }
         try {
-          const listResult = await env.url.list();
-          const totalLinks = listResult.keys.filter(k => !k.name.startsWith('ratelimit:')).length;
+          const keys = await listAllKeys(env.url);
+          const totalLinks = keys.filter(k => !k.name.startsWith('ratelimit:')).length;
           
           return addSecurityHeaders(new Response(
             JSON.stringify({
@@ -875,45 +952,23 @@ export default {
       // Route: GET /api/links - List all shortened links
       if (pathname === '/api/links' && request.method === 'GET') {
         // Verify API Key for security
-        if (!verifyApiKey(request, apiKey)) {
-          return addSecurityHeaders(new Response(
-            JSON.stringify({ error: 'Unauthorized: Invalid or missing API key' }),
-            { status: 401, headers: { 'Content-Type': 'application/json' } }
-          ));
+        if (!isAdmin(request, env)) {
+          return jsonResponse({ error: 'Unauthorized: admin access required' }, 401);
         }
         
         // Apply rate limiting
-        const rateLimitKey = `ratelimit:${clientIP}`;
-        const rateLimitData = await env.url.get(rateLimitKey);
-        const now = Math.floor(Date.now() / 1000);
-        
-        let rateLimitInfo = { count: 0, resetTime: now + RATE_LIMIT_WINDOW };
-        if (rateLimitData) {
-          rateLimitInfo = JSON.parse(rateLimitData);
-          if (now < rateLimitInfo.resetTime && rateLimitInfo.count >= RATE_LIMIT_REQUESTS) {
-            return addSecurityHeaders(new Response(
-              JSON.stringify({ error: 'Rate limit exceeded' }),
-              { status: 429, headers: { 'Content-Type': 'application/json' } }
-            ));
-          }
-          if (now >= rateLimitInfo.resetTime) {
-            rateLimitInfo = { count: 1, resetTime: now + RATE_LIMIT_WINDOW };
-          } else {
-            rateLimitInfo.count++;
-          }
-        } else {
-          rateLimitInfo = { count: 1, resetTime: now + RATE_LIMIT_WINDOW };
+        const rateLimit = await consumeRateLimit('admin-list', request, env.url);
+        if (!rateLimit.allowed) {
+          return jsonResponse({ error: 'Rate limit exceeded' }, 429, {
+            'Retry-After': String(rateLimit.retryAfter)
+          });
         }
         
-        await env.url.put(rateLimitKey, JSON.stringify(rateLimitInfo), { 
-          expirationTtl: RATE_LIMIT_WINDOW + 10 
-        });
-        
         try {
-          const listResult = await env.url.list();
+          const keys = await listAllKeys(env.url);
           const links = [];
           
-          for (const key of listResult.keys) {
+          for (const key of keys) {
             // Skip rate limit entries
             if (key.name.startsWith('ratelimit:')) continue;
             
@@ -923,10 +978,12 @@ export default {
                 const linkData = JSON.parse(linkDataStr);
                 links.push({
                   slug: key.name,
-                  shortUrl: `https://${CUSTOM_DOMAIN}/${escapeHtml(key.name)}`,
+                  shortUrl: `https://${CUSTOM_DOMAIN}/${encodeURIComponent(key.name)}`,
                   originalUrl: linkData.url,
                   createdAt: linkData.created,
-                  clicks: linkData.clicks || 0
+                  clicks: linkData.clicks || 0,
+                  title: linkData.title || null,
+                  expiresAt: linkData.expiresAt || null
                 });
               } catch (e) {
                 console.error('Error parsing link data:', e);
@@ -953,44 +1010,44 @@ export default {
           ));
         }
       }
+
+      // Route: DELETE /api/links - Delete all links (admin only)
+      if (pathname === '/api/links' && request.method === 'DELETE') {
+        if (!isAdmin(request, env)) {
+          return jsonResponse({ error: 'Unauthorized: admin access required' }, 401);
+        }
+        const rateLimit = await consumeRateLimit('admin-delete-all', request, env.url);
+        if (!rateLimit.allowed) {
+          return jsonResponse({ error: 'Rate limit exceeded' }, 429, {
+            'Retry-After': String(rateLimit.retryAfter)
+          });
+        }
+        try {
+          const keys = await listAllKeys(env.url);
+          const linkKeys = keys.filter(key => !key.name.startsWith('ratelimit:'));
+          await Promise.all(linkKeys.map(key => env.url.delete(key.name)));
+          return jsonResponse({ message: 'All links deleted successfully', deleted: linkKeys.length });
+        } catch (error) {
+          console.error('Error deleting all links:', error);
+          return jsonResponse({ error: 'Failed to delete all links' }, 500);
+        }
+      }
       
       // Route: DELETE /api/links/:slug - Delete link with API Key
       if (pathname.startsWith('/api/links/') && request.method === 'DELETE') {
-        if (!verifyApiKey(request, apiKey)) {
-          return addSecurityHeaders(new Response(
-            JSON.stringify({ error: 'Unauthorized: Invalid or missing API key' }),
-            { status: 401, headers: { 'Content-Type': 'application/json' } }
-          ));
+        if (!isAdmin(request, env)) {
+          return jsonResponse({ error: 'Unauthorized: admin access required' }, 401);
         }
         
         // Apply rate limiting
-        const rateLimitKey = `ratelimit:${clientIP}`;
-        const rateLimitData = await env.url.get(rateLimitKey);
-        const now = Math.floor(Date.now() / 1000);
-        
-        let rateLimitInfo = { count: 0, resetTime: now + RATE_LIMIT_WINDOW };
-        if (rateLimitData) {
-          rateLimitInfo = JSON.parse(rateLimitData);
-          if (now < rateLimitInfo.resetTime && rateLimitInfo.count >= RATE_LIMIT_REQUESTS) {
-            return addSecurityHeaders(new Response(
-              JSON.stringify({ error: 'Rate limit exceeded' }),
-              { status: 429, headers: { 'Content-Type': 'application/json' } }
-            ));
-          }
-          if (now >= rateLimitInfo.resetTime) {
-            rateLimitInfo = { count: 1, resetTime: now + RATE_LIMIT_WINDOW };
-          } else {
-            rateLimitInfo.count++;
-          }
-        } else {
-          rateLimitInfo = { count: 1, resetTime: now + RATE_LIMIT_WINDOW };
+        const rateLimit = await consumeRateLimit('admin-delete', request, env.url);
+        if (!rateLimit.allowed) {
+          return jsonResponse({ error: 'Rate limit exceeded' }, 429, {
+            'Retry-After': String(rateLimit.retryAfter)
+          });
         }
         
-        await env.url.put(rateLimitKey, JSON.stringify(rateLimitInfo), { 
-          expirationTtl: RATE_LIMIT_WINDOW + 10 
-        });
-        
-        const slug = pathname.split('/api/links/')[1];
+        const slug = decodeURIComponent(pathname.slice('/api/links/'.length));
         
         // Validate slug
         if (!isValidSlug(slug)) {
@@ -1048,6 +1105,14 @@ export default {
           
           const linkData = JSON.parse(linkDataStr);
           const longUrl = linkData.url;
+
+          if (linkData.expiresAt && Date.now() >= Date.parse(linkData.expiresAt)) {
+            ctx.waitUntil(env.url.delete(slug));
+            return addSecurityHeaders(new Response(generate404(), {
+              status: 404,
+              headers: { 'Content-Type': 'text/html; charset=utf-8' }
+            }));
+          }
           
           // Validate URL exists and is valid
           if (!longUrl || typeof longUrl !== 'string' || !isValidUrl(longUrl)) {
@@ -1064,9 +1129,13 @@ export default {
                 const updated = JSON.stringify({
                   url: longUrl,
                   created: linkData.created || new Date().toISOString(),
-                  clicks: (linkData.clicks || 0) + 1
+                  clicks: (linkData.clicks || 0) + 1,
+                  title: linkData.title || null,
+                  expiresAt: linkData.expiresAt || null
                 });
-                await env.url.put(slug, updated);
+                await env.url.put(slug, updated, linkData.expiresAt ? {
+                  expiration: Math.floor(Date.parse(linkData.expiresAt) / 1000)
+                } : undefined);
               } catch (e) {
                 console.error('Error tracking click:', e);
                 // Silently fail click tracking - don't block redirect
