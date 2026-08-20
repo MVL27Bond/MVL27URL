@@ -1,150 +1,194 @@
 # MVL27URL
 
-> URL shortener chạy trên Cloudflare Edge, có trang quản trị, session admin, API key bật/tắt được và cấu hình website lưu trong KV.
+> URL shortener chạy trên Cloudflare Workers và KV, có trang quản trị, tài khoản admin, API key, mật khẩu tạo link và cấu hình thương hiệu.
 
-[![Cloudflare Workers](https://img.shields.io/badge/runtime-Cloudflare%20Workers-orange)](https://developers.cloudflare.com/workers/)
-[![Cloudflare Pages](https://img.shields.io/badge/deploy-Cloudflare%20Pages-f6821f)](https://developers.cloudflare.com/pages/)
+![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-f6821f?logo=cloudflare&logoColor=white)
+![Storage](https://img.shields.io/badge/storage-KV-2563eb)
+![License](https://img.shields.io/badge/license-internal-64748b)
 
-## Mục lục
+## MVL27URL là gì?
 
-- [Tính năng](#tính-năng)
-- [Kiến trúc và lưu trữ](#kiến-trúc-và-lưu-trữ)
-- [Chạy local](#chạy-local)
-- [Deploy Cloudflare Workers](#deploy-cloudflare-workers-khuyến-nghị)
-- [Deploy Cloudflare Pages](#deploy-cloudflare-pages)
-- [Thiết lập lần đầu](#thiết-lập-lần-đầu)
-- [Sử dụng API](#sử-dụng-api)
-- [Quản trị website](#quản-trị-website)
-- [Bảo mật và giới hạn](#bảo-mật-và-giới-hạn)
-- [Kiểm tra và vận hành](#kiểm-tra-và-vận-hành)
+MVL27URL biến URL dài thành link ngắn:
 
-## Tính năng
+```text
+https://example.com/articles/a-very-long-address
+                           v
+https://short.example.com/demo
+```
 
-- Tạo slug ngẫu nhiên bằng Web Crypto hoặc slug tùy chỉnh tối đa 20 ký tự.
-- Chỉ chấp nhận URL `http://` và `https://`; từ chối scheme nguy hiểm và URL chứa username/password.
-- Link mới được lưu vĩnh viễn trong Cloudflare KV; chỉ admin đăng nhập mới có thể xóa.
-- Theo dõi lượt click và tiêu đề link.
-- Tài khoản admin tạo một lần ngay trên `/links`.
-- Mật khẩu admin được băm PBKDF2 với salt, không lưu plaintext.
-- Session admin dùng cookie `HttpOnly`, `Secure`, `SameSite=Strict`, TTL 24 giờ.
-- API key có thể bật/tắt. API key chỉ dùng cho quyền tạo link, không dùng để mở trang quản trị.
-- Mật khẩu tạo link riêng, tùy chọn, dùng qua header `x-create-password`.
-- Quản lý tên website, logo, domain, API key, mật khẩu tạo link và mật khẩu admin trong tab **Cài đặt**.
-- Rate limit theo IP cho setup, login, tạo link và thao tác admin.
-- Có hỗ trợ migrate link cũ được lưu bằng slug thô; link mới dùng namespace `link:<slug>` để không đụng settings/session.
+Ứng dụng gồm trang tạo link tại `/`, trang quản trị tại `/links`, lưu trữ vĩnh viễn trong Cloudflare KV và quyền xóa link chỉ dành cho admin.
 
-## Kiến trúc và lưu trữ
+## Tính năng chính
 
-Đây là **Cloudflare Worker module**, không phải ứng dụng Node server truyền thống.
+| Nhóm | Tính năng |
+| --- | --- |
+| Link | Slug ngẫu nhiên an toàn, slug tùy chỉnh, title, redirect 302, click counter |
+| Bảo mật | Username/password admin, PBKDF2, session HttpOnly, Origin check, rate limit |
+| Quyền tạo link | Admin session, API key bật/tắt được, mật khẩu tạo link tùy chọn |
+| Quản trị | Danh sách, tìm kiếm, thống kê, xóa một link, xóa toàn bộ link |
+| Branding | Tên website, logo URL, domain short URL |
+| An toàn dữ liệu | Link mới nằm trong `link:<slug>`, không xóa nhầm settings/session |
 
-- `worker.js`: request handler, giao diện HTML, API và redirect.
-- KV binding `url`: lưu settings, session, rate limit và link.
-- `system:settings`: cấu hình website và thông tin xác thực đã hash.
-- `session:<token>`: session admin tạm thời.
-- `link:<slug>`: link mới. Link legacy có slug thô vẫn được đọc để tương thích.
-- `wrangler.toml.example`: mẫu cấu hình deploy Workers.
-- `scripts/build-pages.mjs`: tạo `dist/_worker.js` cho Cloudflare Pages Advanced Mode.
+## Deploy nhanh bằng Cloudflare Dashboard
 
-> Domain trong phần Cài đặt chỉ thay đổi URL được sinh ra và branding. Nó không tự tạo DNS, route Worker hay custom domain trong Cloudflare Dashboard.
+Đây là cách đơn giản nhất: không cần terminal và không cần build project.
 
-## Yêu cầu
+### 1. Tạo Worker
 
-- Node.js 18 trở lên.
-- Tài khoản Cloudflare có quyền Workers KV và Workers/Pages.
-- Domain dùng custom domain phải được thêm vào zone Cloudflare và DNS phải trỏ đúng theo hướng dẫn Cloudflare.
+1. Mở **Cloudflare Dashboard → Workers & Pages**.
+2. Chọn **Create application → Create Worker**.
+3. Đặt tên Worker và bấm **Deploy**.
+4. Chọn **Edit code**, xóa code mẫu.
+5. Mở file `worker.js` trong repository này, copy toàn bộ nội dung và dán vào editor.
+6. Bấm **Save and deploy**.
 
-## Cách nhanh: dán `worker.js` trên Cloudflare Dashboard
+### 2. Tạo và bind KV
 
-Đây là cách dành cho người không muốn dùng terminal. Bạn chỉ cần copy file `worker.js`, nhưng vẫn phải tạo và bind KV một lần để link/settings được lưu vĩnh viễn.
+KV là nơi lưu tài khoản admin, settings và link. Không có KV thì dữ liệu không thể lưu vĩnh viễn.
 
-1. Vào **Cloudflare Dashboard → Workers & Pages → Create application → Create Worker**.
-2. Đặt tên Worker, bấm **Deploy** một lần để tạo Worker.
-3. Mở **Edit code**, xóa code mẫu, mở file `worker.js` trong repository, copy toàn bộ nội dung và paste vào editor.
-4. Bấm **Save and deploy**.
-5. Vào **Worker → Settings → Variables and Secrets → KV namespace bindings → Add binding**.
-6. Đặt **Variable name** là `url` và chọn một KV namespace. Nếu chưa có namespace, vào **Storage & Databases → KV → Create namespace**, tạo namespace rồi quay lại bind.
-7. Bấm **Save** và deploy lại Worker.
-8. Mở URL Worker, truy cập `/links`, rồi tạo tài khoản admin lần đầu.
+1. Vào **Storage & Databases → KV**.
+2. Chọn **Create namespace**, đặt tên ví dụ `MVL27URL_DATA`.
+3. Mở **Worker → Settings → Variables and Secrets**.
+4. Trong **KV namespace bindings**, chọn **Add binding**.
+5. Đặt **Variable name** chính xác là `url`.
+6. Chọn namespace vừa tạo, bấm **Save**, rồi deploy lại Worker.
 
-Nếu muốn bảo vệ setup lần đầu, tạo secret `SETUP_KEY` trong **Variables and Secrets**, sau đó nhập secret này vào trường **Bootstrap key**. Không cần tạo `API_KEY` để chạy cài đặt mới; API key có thể bật ngay trong tab **Cài đặt**.
+Worker cũng nhận binding tên `URLS` hoặc `KV`, nhưng nên dùng `url` để dễ nhớ.
 
-> Nếu quên bind KV, website sẽ hiện trang “Chưa cấu hình lưu trữ” thay vì lỗi server. Không thể bỏ qua KV nếu muốn link và tài khoản tồn tại sau khi Worker restart hoặc deploy lại.
+### 3. Tạo admin lần đầu
 
-### Gắn domain riêng
+1. Mở URL Worker và thêm `/links`.
+2. Ví dụ: `https://mvl27url.username.workers.dev/links`.
+3. Tạo username và mật khẩu admin, tối thiểu 10 ký tự.
+4. Sau setup, bạn sẽ được đăng nhập tự động.
 
-Trong **Worker → Settings → Domains & Routes**, chọn **Add Custom Domain**, nhập domain đã nằm trong zone Cloudflare và hoàn tất DNS. Sau đó vào `/links → Cài đặt`, cập nhật lại trường **Domain** để short URL sinh ra đúng domain.
+### 4. Cấu hình website
 
-## Chạy local
+Trong `/links → Cài đặt`, admin có thể đổi:
+
+- Tên website.
+- Logo bằng URL `http` hoặc `https`.
+- Domain dùng để sinh short URL.
+- API key.
+- Mật khẩu tạo link.
+- Mật khẩu admin.
+
+> Đổi trường **Domain** không tự tạo DNS. Muốn dùng domain riêng, hãy thêm Custom Domain cho Worker trước.
+
+### Nếu quên bind KV
+
+Website sẽ hiện trang **Chưa cấu hình lưu trữ** thay vì lỗi 500. Hãy bind KV với tên `url`, `URLS` hoặc `KV`, sau đó reload trang.
+
+## Bảo vệ setup lần đầu bằng `SETUP_KEY`
+
+Nếu Worker đã public trước khi setup, nên tạo secret bootstrap:
+
+1. Vào **Worker → Settings → Variables and Secrets**.
+2. Chọn **Add secret**.
+3. Đặt tên `SETUP_KEY` và nhập giá trị khó đoán.
+4. Deploy lại Worker.
+5. Nhập giá trị này vào trường **Bootstrap key** khi setup.
+
+Sau setup lần đầu, endpoint setup tự khóa.
+
+## Cấu hình quyền tạo link
+
+| API key | Mật khẩu tạo link | Ai được tạo link |
+| :---: | :---: | --- |
+| Tắt | Không đặt | Chỉ admin đã đăng nhập |
+| Tắt | Đã đặt | Admin hoặc người có mật khẩu |
+| Bật | Không đặt | Admin hoặc người có API key |
+| Bật | Đã đặt | Admin, API key hoặc mật khẩu |
+
+API key chỉ có quyền tạo link, không có quyền xem hoặc xóa link. API key tối thiểu 16 ký tự và được hash trước khi lưu KV. Mật khẩu tạo link gửi bằng header `x-create-password`; nhập `-` trong Cài đặt để tắt.
+
+## Custom domain
+
+1. Vào **Worker → Settings → Domains & Routes**.
+2. Chọn **Add Custom Domain**.
+3. Nhập domain đã nằm trong zone Cloudflare.
+4. Hoàn tất DNS theo hướng dẫn Cloudflare.
+5. Vào `/links → Cài đặt`, đặt trường **Domain** bằng domain vừa thêm.
+
+Kết quả:
+
+```text
+https://short.example.com/demo
+```
+
+## Sử dụng API
+
+### Tạo link bằng API key
+
+```bash
+curl -X POST "https://short.example.com/shorten" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -d '{"url":"https://example.com/a-long-path","slug":"demo","title":"Demo"}'
+```
+
+### Tạo link bằng mật khẩu riêng
+
+```bash
+curl -X POST "https://short.example.com/shorten" \
+  -H "Content-Type: application/json" \
+  -H "x-create-password: YOUR_CREATE_PASSWORD" \
+  -d '{"url":"https://example.com/a-long-path"}'
+```
+
+Response thành công:
+
+```json
+{
+  "slug": "demo",
+  "shortUrl": "https://short.example.com/demo",
+  "originalUrl": "https://example.com/a-long-path",
+  "permanent": true,
+  "createdAt": "2026-08-20T00:00:00.000Z"
+}
+```
+
+### Danh sách endpoint
+
+| Method | Endpoint | Quyền | Mô tả |
+| --- | --- | --- | --- |
+| `GET` | `/api/setup-status` | Public | Kiểm tra trạng thái setup |
+| `POST` | `/api/setup` | Một lần | Tạo admin đầu tiên |
+| `POST` | `/api/auth/login` | Public | Đăng nhập admin |
+| `POST` | `/api/auth/logout` | Admin | Đăng xuất |
+| `POST` | `/shorten` | Admin/API key/create password | Tạo link |
+| `GET` | `/api/links` | Admin | Xem toàn bộ link |
+| `GET` | `/api/stats` | Admin | Xem thống kê |
+| `GET` | `/api/settings` | Admin | Xem settings |
+| `PUT` | `/api/settings` | Admin | Cập nhật settings |
+| `DELETE` | `/api/links/:slug` | Admin | Xóa một link |
+| `DELETE` | `/api/links` | Admin | Xóa toàn bộ link |
+| `GET` | `/:slug` | Public | Redirect tới URL gốc |
+
+## Deploy bằng Wrangler
+
+Dùng cách này khi muốn quản lý deployment bằng Git/CLI.
 
 ```bash
 npm install
-cp wrangler.toml.example wrangler.toml
-```
-
-Mở `wrangler.toml`, thay `REPLACE_WITH_KV_NAMESPACE_ID` bằng namespace ID thật. Tạo namespace:
-
-```bash
-npx wrangler kv namespace create URLS
-npx wrangler kv namespace create URLS --preview
-```
-
-Điền cả `id` và `preview_id` nếu cần chạy preview. Sau đó chạy:
-
-```bash
-npx wrangler dev
-```
-
-Mở URL local mà Wrangler hiển thị và truy cập `/links` để setup.
-
-## Deploy Cloudflare Workers (khuyến nghị)
-
-### 1. Đăng nhập và tạo KV
-
-```bash
 npx wrangler login
+cp wrangler.toml.example wrangler.toml
 npx wrangler kv namespace create URLS
-```
-
-Copy namespace ID vào `wrangler.toml`. Không commit file này nếu bạn không muốn lưu ID deployment trong Git.
-
-### 2. Secret tùy chọn
-
-`API_KEY` chỉ cần cho migrate hệ thống cũ hoặc muốn có API key mặc định từ environment. Cài đặt mới nên bật API key trong `/links`.
-
-```bash
-npx wrangler secret put API_KEY
-```
-
-Để bảo vệ endpoint setup lần đầu bằng một secret bootstrap:
-
-```bash
-npx wrangler secret put SETUP_KEY
-```
-
-Nếu `SETUP_KEY` tồn tại, nhập giá trị đó vào trường **Bootstrap key** trong `/links` hoặc gửi header `x-setup-key`.
-
-### 3. Deploy
-
-```bash
 npx wrangler deploy
 ```
 
-Sau khi deploy:
+Copy namespace ID vào `wrangler.toml` trước khi deploy. Secret tùy chọn:
 
-1. Mở `https://<worker-subdomain>/links`.
-2. Tạo username và mật khẩu admin.
-3. Đặt domain/logo/tên website trong tab **Cài đặt**.
-4. Bật API key hoặc đặt mật khẩu tạo link nếu muốn người khác sử dụng.
+```bash
+npx wrangler secret put SETUP_KEY
+npx wrangler secret put API_KEY
+```
 
-### 4. Custom domain
-
-Trong Cloudflare Dashboard vào **Workers & Pages → Worker → Settings → Domains & Routes**, thêm custom domain. Sau khi DNS hoạt động, đặt đúng domain đó trong tab **Cài đặt** để URL sinh ra khớp domain.
+Không commit `wrangler.toml` hoặc secret vào Git.
 
 ## Deploy Cloudflare Pages
 
-Worker này có thể chạy trên Cloudflare Pages bằng **Advanced Mode**. Pages sẽ serve file `_worker.js` trong thư mục output.
-
-### Deploy thủ công bằng CLI
+Worker này có thể chạy bằng Pages Advanced Mode:
 
 ```bash
 npm install
@@ -153,165 +197,59 @@ npx wrangler pages project create mvl27url
 npx wrangler pages deploy dist --project-name mvl27url
 ```
 
-Khi Pages hỏi production branch, chọn branch bạn muốn dùng. Tạo KV namespace như phần Workers, sau đó bind KV cho Pages project:
+Trong Pages project, vào **Settings → Functions**, thêm KV namespace binding với variable name `url`, rồi redeploy.
 
-```bash
-npx wrangler pages secret put SETUP_KEY --project-name mvl27url
-```
+Nếu dùng Git integration:
 
-KV binding `url` cần được thêm trong Cloudflare Dashboard:
+- Build command: `npm run build:pages`
+- Build output directory: `dist`
 
-1. **Workers & Pages → mvl27url → Settings → Functions**.
-2. Thêm KV namespace binding với variable name chính xác là `url`.
-3. Chọn namespace đã tạo.
-4. Redeploy Pages project.
+## Lưu trữ và tương thích dữ liệu
 
-> Pages Git integration dùng **Build command** `npm run build:pages` và **Build output directory** `dist`. Không tạo thư mục `functions/`; Advanced Mode sử dụng `dist/_worker.js` làm Worker entrypoint.
+| Prefix/key | Mục đích |
+| --- | --- |
+| `system:settings` | Settings và thông tin xác thực đã hash |
+| `session:<token>` | Session admin, tự hết hạn sau 24 giờ |
+| `link:<slug>` | Link mới |
+| `ratelimit:<type>:<ip>` | Rate limit tạm thời |
 
-> Nếu muốn cấu hình KV bằng file Wrangler và deploy có kiểm soát, dùng Workers deployment ở trên. Pages phù hợp khi bạn muốn quản lý domain và pipeline qua Pages Dashboard.
-
-## Thiết lập lần đầu
-
-1. Mở `/links`.
-2. Nhập username admin và mật khẩu tối thiểu 10 ký tự.
-3. Có thể đặt mật khẩu tạo link riêng.
-4. Có thể nhập API key tối thiểu 16 ký tự để bật quyền API cho người khác.
-5. Nếu deploy với `SETUP_KEY`, nhập bootstrap key.
-6. Sau khi setup, session được tạo tự động và bạn có thể mở tab **Cài đặt**.
-
-Chính sách tạo link:
-
-| API key | Mật khẩu tạo link | Ai được tạo link |
-| --- | --- | --- |
-| Tắt | Không đặt | Chỉ admin session |
-| Tắt | Đã đặt | Admin hoặc người có mật khẩu |
-| Bật | Không đặt | Admin hoặc người có API key |
-| Bật | Đã đặt | Admin, API key hoặc mật khẩu |
-
-## Sử dụng API
-
-### Tạo link bằng API key
-
-```bash
-curl -X POST https://short.example.com/shorten \
-	-H 'Content-Type: application/json' \
-	-H 'x-api-key: YOUR_API_KEY' \
-	-d '{"url":"https://example.com/a-long-path","slug":"demo","title":"Demo"}'
-```
-
-### Tạo link bằng mật khẩu riêng
-
-```bash
-curl -X POST https://short.example.com/shorten \
-	-H 'Content-Type: application/json' \
-	-H 'x-create-password: YOUR_CREATE_PASSWORD' \
-	-d '{"url":"https://example.com/a-long-path"}'
-```
-
-### Các endpoint
-
-| Method | Endpoint | Quyền | Mục đích |
-| --- | --- | --- | --- |
-| `GET` | `/api/setup-status` | Public | Đọc trạng thái setup và cấu hình public |
-| `POST` | `/api/setup` | One-time | Tạo tài khoản admin lần đầu |
-| `POST` | `/api/auth/login` | Public | Đăng nhập admin |
-| `POST` | `/api/auth/logout` | Admin session | Đăng xuất |
-| `POST` | `/shorten` | Admin/API key/create password | Tạo link vĩnh viễn |
-| `GET` | `/api/links` | Admin session | Liệt kê link |
-| `GET` | `/api/stats` | Admin session | Thống kê hệ thống |
-| `GET` | `/api/settings` | Admin session | Đọc settings |
-| `PUT` | `/api/settings` | Admin session | Cập nhật settings |
-| `DELETE` | `/api/links/:slug` | Admin session | Xóa một link |
-| `DELETE` | `/api/links` | Admin session | Xóa toàn bộ link |
-| `GET` | `/:slug` | Public | Redirect và ghi click |
-
-## Quản trị website
-
-Trong `/links → Cài đặt`, admin có thể:
-
-- Đổi tên website, logo URL và domain sinh short URL.
-- Bật/tắt API key.
-- Đặt API key mới; API key được hash trước khi lưu KV.
-- Đặt mật khẩu tạo link hoặc nhập `-` để tắt.
-- Đổi mật khẩu admin. Khi đổi mật khẩu, session cũ bị vô hiệu hóa.
-- Xóa từng link hoặc xóa toàn bộ link. Thao tác xóa toàn bộ luôn yêu cầu nhập `DELETE`.
+Link cũ lưu bằng slug thô vẫn được đọc và redirect. Chỉ admin mới có thể xóa link.
 
 ## Bảo mật và giới hạn
 
-- Không commit `wrangler.toml` có secret hoặc API key.
-- Dùng HTTPS cho production; cookie admin có cờ `Secure`.
-- Link mới chỉ nhận `http`/`https`, không nhận credential trong URL.
-- Các response JSON không được cache (`no-store, private`).
-- Request thay đổi trạng thái được kiểm tra `Origin` và cookie dùng `SameSite=Strict`.
-- Cloudflare KV là eventual consistency: rate limit, setup đồng thời, slug tùy chỉnh đồng thời và click counter không phải primitive atomic. Với lưu lượng lớn hoặc yêu cầu analytics chính xác, chuyển counter/rate limit/bootstrap sang Durable Objects hoặc Cloudflare Rate Limiting.
-- Trang admin hiện tải toàn bộ link để tìm kiếm tại client. Khi namespace rất lớn, nên thêm API pagination/index riêng trước khi mở rộng quy mô.
-- `DELETE /api/links` chỉ xóa keys nhận diện là link; không xóa settings, session hoặc rate-limit keys.
-- CORS mặc định phục vụ cùng custom domain. Nếu dùng frontend khác origin, cần thiết kế allowlist origin riêng trước khi mở rộng CORS.
+- Dùng HTTPS cho production.
+- Không chia sẻ API key hoặc mật khẩu tạo link.
+- URL chỉ nhận scheme `http` và `https`; URL chứa username/password bị từ chối.
+- Session admin dùng cookie `HttpOnly`, `Secure`, `SameSite=Strict`.
+- Đổi mật khẩu admin sẽ vô hiệu hóa session cũ.
+- API JSON có `Cache-Control: no-store`.
+- Request thay đổi dữ liệu được kiểm tra Origin.
+- Rate limit mặc định là 50 request/giờ theo IP; setup có giới hạn riêng.
+- Cloudflare KV là eventual consistency. Rate limit, slug trùng đồng thời và click counter không phải thao tác atomic.
+- Với lưu lượng lớn hoặc analytics chính xác, nên chuyển counter/rate limit sang Durable Objects hoặc Cloudflare Rate Limiting.
+- Trang admin tải toàn bộ link để tìm kiếm tại client; nên bổ sung pagination khi dữ liệu rất lớn.
 
-## Backup và migration KV
-
-Trước khi deploy bản mới hoặc xóa hàng loạt, export KV bằng Wrangler:
-
-```bash
-npx wrangler kv key list --namespace-id YOUR_NAMESPACE_ID
-npx wrangler kv key get 'system:settings' --namespace-id YOUR_NAMESPACE_ID
-```
-
-Không xóa `system:settings`, `session:*` hoặc `ratelimit:*` khi viết script dọn dữ liệu. Link legacy lưu bằng slug thô vẫn được đọc; link mới lưu dưới `link:<slug>`.
-
-## Kiểm tra và vận hành
-
-Kiểm tra cú pháp:
+## Kiểm tra local
 
 ```bash
+npm install
 npm run check
+npm run build:pages
 ```
 
-Smoke test nên bao phủ:
+Nên kiểm tra setup, login/logout, đổi mật khẩu, API key, mật khẩu tạo link, URL không hợp lệ, redirect và thao tác xóa link.
 
-- Setup lần đầu và setup lần hai bị từ chối.
-- Login sai/đúng, logout và session hết hạn.
-- API key bật/tắt, mật khẩu tạo link.
-- Tạo URL độc hại bị từ chối.
-- Link redirect, list, xóa một link và xóa toàn bộ không ảnh hưởng settings.
-- Custom domain/logo/settings sau redeploy.
+## Cấu trúc project
+
+```text
+.
+├── worker.js                 # Worker chính và giao diện HTML
+├── wrangler.toml.example     # Cấu hình mẫu cho Wrangler
+├── package.json              # Scripts kiểm tra/build
+└── scripts/
+    └── build-pages.mjs       # Tạo dist/_worker.js cho Pages
+```
 
 ## License
 
 Dự án nội bộ MVL27URL. Bổ sung license riêng nếu phát hành công khai.
-# MVL27URL
-
-Cloudflare Workers URL shortener dùng KV namespace.
-
-## Cấu hình
-
-- Bind KV namespace với tên `url`.
-- Bind secret `API_KEY` dài tối thiểu 16 ký tự nếu muốn dùng API key legacy khi migrate; cấu hình mới được tạo và hash trong KV qua `/links`.
-- Custom domain mặc định là `url.mvl27.bond`; cập nhật `CUSTOM_DOMAIN` trong `worker.js` nếu triển khai domain khác.
-
-## Tính năng
-
-- Tạo slug ngẫu nhiên bằng Web Crypto, hoặc slug tùy chỉnh tối đa 20 ký tự.
-- Chỉ nhận URL `http`/`https`, không nhận `javascript:`, scheme lạ hoặc URL chứa thông tin đăng nhập.
-- Link được lưu vĩnh viễn trong KV; chỉ admin đã đăng nhập mới có thể xóa.
-- Theo dõi lượt click, tiêu đề tùy chọn và danh sách link được sắp xếp theo thời gian tạo.
-- Rate limit riêng cho tạo link, login và các thao tác admin, tối đa 50 request/giờ theo IP.
-- Lần đầu mở `/links`, admin tự tạo username và mật khẩu. Session dùng cookie `HttpOnly`, không lưu mật khẩu plaintext.
-- Admin có thể bật/tắt API key, đặt mật khẩu tạo link tùy chọn, và quản lý tên website, logo, domain trong tab Cài đặt.
-- Khi API key tắt và không đặt mật khẩu tạo link, chỉ phiên admin đăng nhập mới được tạo link.
-
-## API
-
-Session admin được tạo qua `/api/auth/login`. API key (nếu được bật) chỉ dùng để tạo link, với header `x-api-key: <API_KEY>`. Mật khẩu tạo link dùng header `x-create-password: <PASSWORD>`.
-
-- `POST /api/setup`: thiết lập tài khoản admin một lần.
-- `POST /api/auth/login` và `POST /api/auth/logout`: quản lý session admin.
-- `POST /shorten`: tạo link vĩnh viễn. Body: `{ "url": "https://example.com", "slug": "optional", "title": "optional" }`.
-- `GET /api/links`: liệt kê toàn bộ link, có phân trang KV nội bộ.
-- `GET /api/stats`: thống kê hệ thống.
-- `GET /api/settings` và `PUT /api/settings`: đọc/cập nhật cấu hình website, chỉ admin.
-- `DELETE /api/links/:slug`: xóa một link.
-- `DELETE /api/links`: xóa toàn bộ link, chỉ dùng sau xác nhận admin.
-- `GET /:slug`: redirect và ghi nhận click.
-
-Giao diện người dùng ở `/`, giao diện quản trị ở `/links`.
