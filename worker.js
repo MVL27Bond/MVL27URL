@@ -924,8 +924,8 @@ function generateLinksPage(settings = DEFAULT_SETTINGS) {
                 '<td><span class="link-created">' + formattedDate + '</span></td>' +
                 '<td><span class="link-clicks">' + (link.clicks || 0) + '</span></td>' +
                 '<td><div class="actions">' +
-                  '<button class="action-btn copy-btn" onclick="copyLink(\'' + link.shortUrl.replace(/'/g, "\\'") + '\', this)">📋 Copy</button>' +
-                  '<button class="action-btn delete-btn" onclick="deleteLink(\'' + link.slug.replace(/'/g, "\\'") + '\')">🗑️ Xóa</button>' +
+                  '<button class="action-btn copy-btn" data-action="copy" data-url="' + escapeHtml(link.shortUrl) + '">📋 Copy</button>' +
+                  '<button class="action-btn delete-btn" data-action="delete" data-slug="' + escapedSlug + '">🗑️ Xóa</button>' +
                 '</div></td>' +
                 '</tr>';
             }).join('');
@@ -984,6 +984,13 @@ function generateLinksPage(settings = DEFAULT_SETTINGS) {
                 showError('Lỗi: ' + e.message);
             }
         }
+
+          document.addEventListener('click', (event) => {
+            const button = event.target.closest('[data-action]');
+            if (!button) return;
+            if (button.dataset.action === 'copy') copyLink(button.dataset.url, button);
+            if (button.dataset.action === 'delete') deleteLink(button.dataset.slug);
+          });
         
         async function initializeAuth() {
           const status = await fetch('/api/setup-status').then(response => response.json());
@@ -1186,7 +1193,7 @@ export default {
       // Route: GET /links - Links Management Page (MUST come before /:slug)
       if (pathname === '/links' && request.method === 'GET') {
         return addSecurityHeaders(new Response(generateLinksPage(settings), {
-          headers: { 'Content-Type': 'text/html; charset=utf-8' },
+          headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, private' },
           status: 200
         }));
       }
